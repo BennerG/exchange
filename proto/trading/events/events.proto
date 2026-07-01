@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package trading.events;
+
+option go_package = "github.com/BennerG/exchange/internal/gen/trading/events";
+
+import "google/protobuf/timestamp.proto";
+
+message Money {
+  int64 amount_cents = 1;
+  string currency = 2;
+}
+
+message OrderSubmitted {
+  string order_id = 1;
+  string user_id = 2;
+  int64 quantity = 3;
+  Money price_per_share = 4;
+  OrderSide side = 5;
+  google.protobuf.Timestamp submitted_at = 6;
+}
+
+message Filled {
+  string order_id = 1;
+  int64 filled_quantity = 2;
+  Money fill_price = 3;
+  string counterparty_user_id = 4;
+  int64 remaining_quantity = 5;
+  google.protobuf.Timestamp filled_at = 6;
+}
+
+message PartialFillRejected {
+  string order_id = 1;
+  int64 filled_quantity = 2;
+  Money fill_price = 3;
+  int64 remaining_quantity = 4;
+  RejectionReason reason = 5;
+  google.protobuf.Timestamp rejected_at = 6;
+}
+
+message Rejected {
+  string order_id = 1;
+  RejectionReason reason = 2;
+  string message = 3;
+  google.protobuf.Timestamp rejected_at = 4;
+}
+
+message OrderCancelled {
+  string order_id = 1;
+  string user_id = 2;
+  int64 cancelled_quantity = 3;
+  google.protobuf.Timestamp cancelled_at = 4;
+}
+
+message Event {
+  oneof payload {
+    OrderSubmitted order_submitted = 1;
+    Filled filled = 2;
+    PartialFillRejected partial_fill_rejected = 3;
+    Rejected rejected = 4;
+    OrderCancelled order_cancelled = 5;
+  }
+}
+
+enum OrderSide {
+  BUY = 0;
+  SELL = 1;
+}
+
+enum RejectionReason {
+  INSUFFICIENT_FUNDS = 0;
+  INSUFFICIENT_SHARES = 1;
+  INVALID_PRICE = 2;
+  ORDER_BOOK_ERROR = 3;
+  INTERNAL_ERROR = 4;
+  CANCELLED_BY_USER = 5;
+}

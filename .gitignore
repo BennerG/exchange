@@ -1,0 +1,23 @@
+# Binaries
+/bin/
+/exchange-producer
+/exchange-consumer
+
+# Environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Local docker volumes
+kraft-combined-logs/

@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
@@ -58,8 +59,8 @@ func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
 	event := &pb.Event{
 		Payload: &pb.Event_OrderSubmitted{
 			OrderSubmitted: &pb.OrderSubmitted{
-				OrderId: orderID,
-				UserId:  req.UserID,
+				OrderId:  orderID,
+				UserId:   req.UserID,
 				Quantity: req.Quantity,
 				PricePerShare: &pb.Money{
 					AmountCents: req.PricePerShare.AmountCents,
@@ -84,11 +85,11 @@ func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
 func validateOrder(req orderRequest) error {
 	switch {
 	case req.UserID == "":
-		return errorf("user_id is required")
+		return fmt.Errorf("user_id is required")
 	case req.Quantity <= 0:
-		return errorf("quantity must be greater than 0")
+		return fmt.Errorf("quantity must be greater than 0")
 	case req.PricePerShare.AmountCents <= 0:
-		return errorf("price_per_share.amount_cents must be greater than 0")
+		return fmt.Errorf("price_per_share.amount_cents must be greater than 0")
 	}
 	return nil
 }
@@ -100,6 +101,6 @@ func parseSide(s string) (pb.OrderSide, error) {
 	case "SELL":
 		return pb.OrderSide_SELL, nil
 	default:
-		return 0, errorf("side must be BUY or SELL, got %q", s)
+		return 0, fmt.Errorf("side must be BUY or SELL, got %q", s)
 	}
 }

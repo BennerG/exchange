@@ -8,8 +8,8 @@ import (
 type Side int
 
 const (
-	Buy  Side = iota
-	Sell Side = iota
+	Buy Side = iota
+	Sell
 )
 
 type Order struct {
@@ -20,6 +20,7 @@ type Order struct {
 	Filled      int64
 	PriceCents  int64
 	SubmittedAt time.Time
+	index       int // position within its heap slice, maintained by Push, Pop and Swap
 }
 
 func (o *Order) Remaining() int64 {
@@ -46,14 +47,24 @@ func (h buyHeap) Less(i, j int) bool {
 	}
 	return h[i].SubmittedAt.Before(h[j].SubmittedAt)
 }
-func (h buyHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *buyHeap) Push(x interface{}) { *h = append(*h, x.(*Order)) }
+func (h buyHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *buyHeap) Push(x interface{}) {
+	order := x.(*Order)
+	order.index = len(*h)
+	*h = append(*h, order)
+}
 func (h *buyHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
-	x := old[n-1]
+	order := old[n-1]
+	old[n-1] = nil
+	order.index = -1
 	*h = old[:n-1]
-	return x
+	return order
 }
 
 // sellHeap is a min-heap by price, then min by time (price-time priority).
@@ -66,20 +77,32 @@ func (h sellHeap) Less(i, j int) bool {
 	}
 	return h[i].SubmittedAt.Before(h[j].SubmittedAt)
 }
-func (h sellHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *sellHeap) Push(x interface{}) { *h = append(*h, x.(*Order)) }
+func (h sellHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *sellHeap) Push(x interface{}) {
+	order := x.(*Order)
+	order.index = len(*h)
+	*h = append(*h, order)
+}
 func (h *sellHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
-	x := old[n-1]
+	order := old[n-1]
+	old[n-1] = nil
+	order.index = -1
 	*h = old[:n-1]
-	return x
+	return order
 }
 
-// Book holds the live bid and ask sides.
+// Book holds the live bid and ask sides, plus a lookup of currently resting
+// orders by ID so Cancel does not need to scan either heap.
 type Book struct {
-	bids *buyHeap
-	asks *sellHeap
+	bids    *buyHeap
+	asks    *sellHeap
+	resting map[string]*Order
 }
 
 func New() *Book {
@@ -87,11 +110,11 @@ func New() *Book {
 	asks := &sellHeap{}
 	heap.Init(bids)
 	heap.Init(asks)
-	return &Book{bids: bids, asks: asks}
+	return &Book{bids: bids, asks: asks, resting: make(map[string]*Order)}
 }
 
 // Add inserts an order and immediately attempts to match it.
-// Returns zero or more FillResults (one per counterparty matched against).
+// Returns zero or more FillResults, one per counterparty matched against.
 func (b *Book) Add(incoming *Order) []FillResult {
 	var fills []FillResult
 
@@ -100,36 +123,35 @@ func (b *Book) Add(incoming *Order) []FillResult {
 		fills = b.matchBuy(incoming)
 		if incoming.Remaining() > 0 {
 			heap.Push(b.bids, incoming)
+			b.resting[incoming.ID] = incoming
 		}
 	case Sell:
 		fills = b.matchSell(incoming)
 		if incoming.Remaining() > 0 {
 			heap.Push(b.asks, incoming)
+			b.resting[incoming.ID] = incoming
 		}
 	}
 
 	return fills
 }
 
-// Cancel removes an order from the book by ID. Returns true if found and removed.
+// Cancel removes a resting order by ID. Returns true if found and removed.
 func (b *Book) Cancel(orderID string) bool {
-	for i, o := range *b.bids {
-		if o.ID == orderID {
-			(*b.bids)[i] = (*b.bids)[b.bids.Len()-1]
-			*b.bids = (*b.bids)[:b.bids.Len()-1]
-			heap.Init(b.bids)
-			return true
-		}
+	order, ok := b.resting[orderID]
+	if !ok {
+		return false
 	}
-	for i, o := range *b.asks {
-		if o.ID == orderID {
-			(*b.asks)[i] = (*b.asks)[b.asks.Len()-1]
-			*b.asks = (*b.asks)[:b.asks.Len()-1]
-			heap.Init(b.asks)
-			return true
-		}
+
+	switch order.Side {
+	case Buy:
+		heap.Remove(b.bids, order.index)
+	case Sell:
+		heap.Remove(b.asks, order.index)
 	}
-	return false
+
+	delete(b.resting, orderID)
+	return true
 }
 
 func (b *Book) matchBuy(buy *Order) []FillResult {
@@ -152,6 +174,7 @@ func (b *Book) matchBuy(buy *Order) []FillResult {
 		})
 		if best.Remaining() == 0 {
 			heap.Pop(b.asks)
+			delete(b.resting, best.ID)
 		}
 	}
 	return fills
@@ -177,14 +200,8 @@ func (b *Book) matchSell(sell *Order) []FillResult {
 		})
 		if best.Remaining() == 0 {
 			heap.Pop(b.bids)
+			delete(b.resting, best.ID)
 		}
 	}
 	return fills
-}
-
-func min(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/IBM/sarama"
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
+	"github.com/IBM/sarama"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -43,8 +43,8 @@ func (k *KafkaPublisher) Publish(_ context.Context, event *pb.Event) error {
 	}
 
 	orderID := ""
-	if os := event.GetOrderSubmitted(); os != nil {
-		orderID = os.OrderId
+	if orderSubmitted := event.GetOrderSubmitted(); orderSubmitted != nil {
+		orderID = orderSubmitted.OrderId
 	}
 
 	msg := &sarama.ProducerMessage{

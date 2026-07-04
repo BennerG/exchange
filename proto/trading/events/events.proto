@@ -21,21 +21,16 @@ message OrderSubmitted {
 }
 
 message Filled {
-  string order_id = 1;
-  int64 filled_quantity = 2;
-  Money fill_price = 3;
-  string counterparty_user_id = 4;
-  int64 remaining_quantity = 5;
-  google.protobuf.Timestamp filled_at = 6;
-}
-
-message PartialFillRejected {
-  string order_id = 1;
-  int64 filled_quantity = 2;
-  Money fill_price = 3;
-  int64 remaining_quantity = 4;
-  RejectionReason reason = 5;
-  google.protobuf.Timestamp rejected_at = 6;
+  string trade_id = 1;               // unique per match, the idempotency key
+  string buy_order_id = 2;
+  string sell_order_id = 3;
+  string buyer_user_id = 4;
+  string seller_user_id = 5;
+  int64 quantity = 6;
+  Money price = 7;
+  int64 buy_order_remaining = 8;     // buy order's remaining quantity after this fill
+  int64 sell_order_remaining = 9;    // sell order's remaining quantity after this fill
+  google.protobuf.Timestamp filled_at = 10;
 }
 
 message Rejected {
@@ -56,9 +51,8 @@ message Event {
   oneof payload {
     OrderSubmitted order_submitted = 1;
     Filled filled = 2;
-    PartialFillRejected partial_fill_rejected = 3;
-    Rejected rejected = 4;
-    OrderCancelled order_cancelled = 5;
+    Rejected rejected = 3;
+    OrderCancelled order_cancelled = 4;
   }
 }
 

@@ -28,9 +28,7 @@ message Filled {
   string seller_user_id = 5;
   int64 quantity = 6;
   Money price = 7;
-  int64 buy_order_remaining = 8;     // buy order's remaining quantity after this fill
-  int64 sell_order_remaining = 9;    // sell order's remaining quantity after this fill
-  google.protobuf.Timestamp filled_at = 10;
+  google.protobuf.Timestamp filled_at = 8;
 }
 
 message Rejected {

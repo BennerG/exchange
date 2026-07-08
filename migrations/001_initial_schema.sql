@@ -9,20 +9,20 @@ CREATE TABLE accounts (
 );
 
 CREATE TABLE transactions (
-  txn_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_id      UUID NOT NULL,
-  fill_sequence INT NOT NULL,
-  buyer_id      UUID NOT NULL,
-  seller_id     UUID NOT NULL,
-  quantity      BIGINT NOT NULL,
-  price_cents   BIGINT NOT NULL,
-  created_at    TIMESTAMP NOT NULL DEFAULT NOW(),
-  UNIQUE(order_id, fill_sequence)
+  trade_id UUID PRIMARY KEY,
+  buy_order_id UUID NOT NULL,
+  sell_order_id UUID NOT NULL,
+  buyer_id UUID NOT NULL,
+  seller_id UUID NOT NULL,
+  quantity BIGINT NOT NULL,
+  price_cents BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_transactions_buyer   ON transactions(buyer_id);
-CREATE INDEX idx_transactions_seller  ON transactions(seller_id);
-CREATE INDEX idx_transactions_order   ON transactions(order_id);
+CREATE INDEX idx_transactions_buyer ON transactions(buyer_id);
+CREATE INDEX idx_transactions_seller ON transactions(seller_id);
+CREATE INDEX idx_transactions_buy_order ON transactions(buy_order_id);
+CREATE INDEX idx_transactions_sell_order ON transactions(sell_order_id);
 CREATE INDEX idx_transactions_created ON transactions(created_at);
 
 CREATE TABLE pending_orders (

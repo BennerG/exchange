@@ -48,10 +48,10 @@ git clone https://github.com/BennerG/exchange.git
 cd exchange
 
 # 2. Spin up containers [Kafka cluster, Confluent schema registry, Postgres, Prometheus]
-docker compose up -d
+docker-compose up -d
 
 # 3. Run migration
-psql "postgresql://postgres:postgres@localhost:5432/exchange" -f migrations/001_initial_schema.sql
+psql "postgresql://exchange:exchange@localhost:5432/exchange" -f migrations/001_initial_schema.sql
 
 # 4. Start producer (consumer still needs to be wired up)
 go run ./cmd/producer
@@ -60,13 +60,24 @@ go run ./cmd/producer
 With the producer running, submit an order:
 
 ```bash
+# Buy order
 curl -X POST localhost:8080/orders \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "user-abc",
+    "user_id": "a1b2c3d4-1111-4a1a-9c1a-000000000001",
     "quantity": 100,
     "price_per_share": {"amount_cents": 47500, "currency": "USD"},
     "side": "BUY"
+  }'
+
+# Sell order
+curl -X POST localhost:8080/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "a1b2c3d4-1111-4a1a-9c1a-000000000002",
+    "quantity": 100,
+    "price_per_share": {"amount_cents": 47500, "currency": "USD"},
+    "side": "SELL"
   }'
 ```
 

@@ -86,6 +86,8 @@ func validateOrder(req orderRequest) error {
 	switch {
 	case req.UserID == "":
 		return fmt.Errorf("user_id is required")
+	case uuid.Validate(req.UserID) != nil:
+		return fmt.Errorf("user_id must be a valid uuid")
 	case req.Quantity <= 0:
 		return fmt.Errorf("quantity must be greater than 0")
 	case req.PricePerShare.AmountCents <= 0:

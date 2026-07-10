@@ -53,11 +53,13 @@ docker-compose up -d
 # 3. Run migration
 psql "postgresql://exchange:exchange@localhost:5432/exchange" -f migrations/001_initial_schema.sql
 
-# 4. Start producer (consumer still needs to be wired up)
+# 4. Start all three services, each in its own terminal
 go run ./cmd/producer
+go run ./cmd/matcher
+go run ./cmd/settler
 ```
 
-With the producer running, submit an order:
+With all three running, submit a resting order and a crossing order:
 
 ```bash
 # Buy order
@@ -81,7 +83,14 @@ curl -X POST localhost:8080/orders \
   }'
 ```
 
-**Current status:** the producer publishes real, idempotent `OrderSubmitted` events to Kafka today. The matcher and settler are implemented and fully tested in isolation but not yet wired into `cmd/consumer`, so an order submitted right now lands durably in Kafka but isn't consumed end to end yet. See [What's Next](#whats-next) below.
+The second request crosses the spread, and the trade settles into Postgres within a second or two. Verify it landed:
+
+```bash
+psql "postgresql://postgres:postgres@localhost:5432/exchange" -c "SELECT * FROM transactions;"
+psql "postgresql://postgres:postgres@localhost:5432/exchange" -c "SELECT * FROM accounts;"
+```
+
+**Current status:** the full pipeline runs end to end, REST submission, idempotent Kafka publish, order matching, exactly-once settlement into PostgreSQL with correct double-entry balances. The matcher's produce step is idempotent but not yet wrapped in a Kafka transaction, see [Known limitation](#known-limitation-the-matchers-order-book-is-not-yet-idempotent-against-redelivery) below. DLQ routing for malformed or unrecoverable messages is not yet built.
 
 ### Running tests
 
@@ -96,7 +105,9 @@ go test ./... -race
 ```
 exchange/
 ├── cmd/
-│   └── producer/             # producer service entrypoint
+│   ├── matcher               # matcher service entrypoint
+│   ├── producer              # producer service entrypoint
+│   └── settler               # settler service entrypoint
 ├── internal/
 │   ├── orderbook/            # price-time priority matching engine, pure in-memory
 │   ├── producer/             # REST handler, Kafka publisher
@@ -160,15 +171,22 @@ A crashed matcher process loses every resting order along with it, since the boo
 
 `internal/store`'s Postgres tests run against a genuine, disposable Postgres container via testcontainers-go rather than a mocked database layer. This tests real constraint enforcement, the unique constraint on `trade_id` is what actually proves the idempotency guarantee, something no mock could verify.
 
+### A poison pill, found by actually running the pipeline
+
+Testing the full pipeline end to end for the first time surfaced a real failure mode that isolated component tests couldn't catch. A test order used a readable placeholder like `user-abc` instead of a real UUID. It passed through the producer and the matcher cleanly, since neither validated the shape of `user_id`, and only failed once the settler tried to insert it into a `uuid` typed Postgres column.
+
+Because the settler only commits a Kafka offset after a message settles successfully, and this message could never succeed no matter how many times it retried, it entered a permanent retry loop, once a second, forever. On a single partition, every trade behind it in the topic was silently blocked too. Nothing crashed and nothing alerted; the pipeline just quietly stopped making progress, arguably a more dangerous failure mode than a crash, since nothing prompts anyone to notice.
+
+The fix has two parts. UUID validation was added at the REST boundary, so malformed input now fails fast with a 400 instead of propagating three services deep. And the incident exposed a real gap in the consumer's error handling: it currently only distinguishes malformed bytes (skip and log) from every other failure (retry), but this was a third case, structurally valid data guaranteed to fail deterministically, which needs its own path rather than being retried alongside genuinely transient failures. That distinction is part of the DLQ design work listed under [What's Next](#whats-next).
+
 ## What's Next
 
-- **Wire the matcher and settler into `cmd/consumer`**, with real Kafka consumer groups: transactional produce and `read_committed` isolation for the matcher, manual offset commit ordered after the database write for the settler.
-- **Matcher idempotency.** Either track which order IDs have already been applied to the book before calling `Add`, or snapshot and restore book state around the Kafka transaction boundary.
+- **Full Kafka transactional produce for the matcher**, `BeginTxn`, `AddOffsetsToTxn`, `CommitTxn`, so consume, match, produce, and offset commit become one atomic unit and the redelivery gap below is fully closed. The matcher currently uses a simpler pattern, idempotent produce plus manual offset commit after publish succeeds, which runs correctly end to end but does not fully close the gap.
 - **Order book persistence**, so a crashed matcher can reconstruct resting orders on restart rather than losing them.
-- **DLQ routing** for messages that fail processing in either consumer.
+- **DLQ routing** for messages that fail processing in either consumer, including a dedicated path for input that is structurally valid but will deterministically fail every retry, distinct from genuinely transient failures.
 - **Prometheus metrics and a Grafana dashboard**: order latency, fill rate, consumer lag, DLQ count.
 - **Multi-stock support**, partitioning by `stock_id`, one order book per partition.
 - **Per-order notification events** (`Filled` from a single order's perspective, alongside the current trade-based event), for a future live fill notification feature.
 - **An automated trading client**, as an ordinary producer client submitting orders through the existing REST API based on a learned strategy, consuming historical or live price data. This would live entirely outside Exchange's own code.
-- **Table-driven refactor** of the producer's five rejection-case tests into one table-driven test.
+- **Table-driven refactor** of the producer's rejection-case tests into one table-driven test.
 - A possible reimplementation of the matching engine in Rust or C++ down the line, once the Go version is complete, to compare latency characteristics directly against a garbage collected runtime.

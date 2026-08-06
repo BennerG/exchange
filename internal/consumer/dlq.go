@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/rs/zerolog/log"
 
 	"github.com/BennerG/exchange/internal/kafka"
 )
@@ -66,4 +67,28 @@ func (k *KafkaDeadLetterPublisher) PublishDeadLetter(_ context.Context, entry De
 
 func (k *KafkaDeadLetterPublisher) Close() error {
 	return k.producer.Close()
+}
+
+// deadLetterAndCommit publishes a message to the dead letter queue and,
+// if that succeeds, marks and commits its offset so the group moves past
+// it. If the DLQ publish itself fails, the offset is left uncommitted so
+// the message redelivers rather than being silently lost. Both
+// GroupHandler and TransactionalGroupHandler share this, since a message
+// that never decoded needs identical handling regardless of which
+// consumer read it.
+func deadLetterAndCommit(dlq DeadLetterPublisher, session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage, reason string) {
+	entry := DeadLetterEntry{
+		SourceTopic: message.Topic,
+		Partition:   message.Partition,
+		Offset:      message.Offset,
+		Reason:      reason,
+		Payload:     message.Value,
+		FailedAt:    time.Now(),
+	}
+	if err := dlq.PublishDeadLetter(session.Context(), entry); err != nil {
+		log.Error().Err(err).Msg("failed to publish to dead letter queue, leaving offset uncommitted")
+		return
+	}
+	session.MarkMessage(message, "")
+	session.Commit()
 }

@@ -13,16 +13,16 @@ import (
 
 const topicFills = "fills"
 
-// KafkaPublisher implements Publisher, sending Filled events to the fills
-// topic with the same idempotent producer configuration as the order
-// producer, keyed by trade_id so every event for one trade stays ordered
-// on one partition.
+// KafkaPublisher publishes Filled events transactionally. Matcher only
+// ever calls Publish, through the plain Publisher interface, and has no
+// awareness that a transaction is open around it. The transaction
+// control methods below exist for TransactionalGroupHandler to call.
 type KafkaPublisher struct {
 	producer sarama.SyncProducer
 }
 
-func NewKafkaPublisher(brokers []string) (*KafkaPublisher, error) {
-	p, err := kafka.NewIdempotentProducer(brokers)
+func NewKafkaPublisher(brokers []string, transactionalID string) (*KafkaPublisher, error) {
+	p, err := kafka.NewTransactionalProducer(brokers, transactionalID)
 	if err != nil {
 		return nil, err
 	}
@@ -50,6 +50,14 @@ func (k *KafkaPublisher) Publish(_ context.Context, event *pb.Event) error {
 		return fmt.Errorf("send to kafka: %w", err)
 	}
 	return nil
+}
+
+func (k *KafkaPublisher) BeginTxn() error  { return k.producer.BeginTxn() }
+func (k *KafkaPublisher) CommitTxn() error { return k.producer.CommitTxn() }
+func (k *KafkaPublisher) AbortTxn() error  { return k.producer.AbortTxn() }
+
+func (k *KafkaPublisher) AddMessageToTxn(msg *sarama.ConsumerMessage, groupID string, metadata *string) error {
+	return k.producer.AddMessageToTxn(msg, groupID, metadata)
 }
 
 func (k *KafkaPublisher) Close() error {

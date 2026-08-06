@@ -12,6 +12,8 @@ import (
 	"github.com/BennerG/exchange/internal/producer"
 )
 
+const userID = "a1b2c3d4-1111-4a1a-9c1a-000000000001"
+
 // stubPublisher captures the last event published so tests can assert on it.
 type stubPublisher struct {
 	published *pb.Event
@@ -43,7 +45,7 @@ func TestSubmitBuyOrder(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -71,8 +73,8 @@ func TestSubmitBuyOrder(t *testing.T) {
 	if submitted == nil {
 		t.Fatal("expected OrderSubmitted payload")
 	}
-	if submitted.UserId != "user-abc" {
-		t.Errorf("user_id: want user-abc, got %s", submitted.UserId)
+	if submitted.UserId != userID {
+		t.Errorf("user_id: want %s, got %s", userID, submitted.UserId)
 	}
 	if submitted.Quantity != 100 {
 		t.Errorf("quantity: want 100, got %d", submitted.Quantity)
@@ -91,7 +93,7 @@ func TestSubmitSellOrder(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-xyz",
+		"user_id":  userID,
 		"quantity": 50,
 		"price_per_share": map[string]any{
 			"amount_cents": 47600,
@@ -138,7 +140,7 @@ func TestZeroQuantity(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": 0,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -158,7 +160,7 @@ func TestNegativeQuantity(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": -10,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -178,7 +180,7 @@ func TestZeroPriceCents(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 0,
@@ -198,7 +200,7 @@ func TestInvalidSide(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -220,7 +222,7 @@ func TestOrderIDIsStableInResponse(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  "user-abc",
+		"user_id":  userID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,

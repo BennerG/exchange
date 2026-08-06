@@ -19,11 +19,12 @@ func main() {
 
 	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	groupID := envOr("GROUP_ID", "exchange-matcher")
+	transactionalID := envOr("TRANSACTIONAL_ID", "exchange-matcher-txn")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pub, err := consumer.NewKafkaPublisher(brokers)
+	pub, err := consumer.NewKafkaPublisher(brokers, transactionalID)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create kafka publisher")
 	}

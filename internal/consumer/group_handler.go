@@ -51,7 +51,7 @@ func (h *GroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 					Str("topic", message.Topic).
 					Int64("offset", message.Offset).
 					Msg("failed to unmarshal event, routing to dead letter queue")
-				h.deadLetter(session, message, fmt.Sprintf("unmarshal failed: %v", err))
+				deadLetterAndCommit(h.dlq, session, message, fmt.Sprintf("unmarshal failed: %v", err))
 				continue
 			}
 
@@ -67,7 +67,7 @@ func (h *GroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 					Str("topic", message.Topic).
 					Int64("offset", message.Offset).
 					Msg("permanent failure, routing to dead letter queue")
-				h.deadLetter(session, message, err.Error())
+				deadLetterAndCommit(h.dlq, session, message, err.Error())
 				continue
 			}
 

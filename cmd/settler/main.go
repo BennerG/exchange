@@ -45,10 +45,6 @@ func main() {
 	cfg.Consumer.Offsets.AutoCommit.Enable = false
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 	cfg.Consumer.Return.Errors = true
-	// No transactional producer exists yet, so nothing on the fills topic
-	// is ever part of an aborted transaction today. Setting this now costs
-	// nothing and avoids a silent gap the day the matcher gains real
-	// Kafka transactions.
 	cfg.Consumer.IsolationLevel = sarama.ReadCommitted
 
 	group, err := sarama.NewConsumerGroup(brokers, groupID, cfg)

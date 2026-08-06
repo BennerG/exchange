@@ -12,7 +12,10 @@ import (
 	"github.com/BennerG/exchange/internal/producer"
 )
 
-const userID = "a1b2c3d4-1111-4a1a-9c1a-000000000001"
+const (
+	testBuyerID  = "a1b2c3d4-1111-4a1a-9c1a-000000000001"
+	testSellerID = "a1b2c3d4-1111-4a1a-9c1a-000000000002"
+)
 
 // stubPublisher captures the last event published so tests can assert on it.
 type stubPublisher struct {
@@ -45,7 +48,7 @@ func TestSubmitBuyOrder(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  userID,
+		"user_id":  testBuyerID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -73,17 +76,17 @@ func TestSubmitBuyOrder(t *testing.T) {
 	if submitted == nil {
 		t.Fatal("expected OrderSubmitted payload")
 	}
-	if submitted.UserId != userID {
-		t.Errorf("user_id: want %s, got %s", userID, submitted.UserId)
+	if submitted.GetUserId() != testBuyerID {
+		t.Errorf("user_id: want %s, got %s", testBuyerID, submitted.GetUserId())
 	}
-	if submitted.Quantity != 100 {
-		t.Errorf("quantity: want 100, got %d", submitted.Quantity)
+	if submitted.GetQuantity() != 100 {
+		t.Errorf("quantity: want 100, got %d", submitted.GetQuantity())
 	}
-	if submitted.PricePerShare.AmountCents != 47500 {
-		t.Errorf("price_cents: want 47500, got %d", submitted.PricePerShare.AmountCents)
+	if submitted.GetPricePerShare().GetAmountCents() != 47500 {
+		t.Errorf("price_cents: want 47500, got %d", submitted.GetPricePerShare().GetAmountCents())
 	}
-	if submitted.Side != pb.OrderSide_BUY {
-		t.Errorf("side: want BUY, got %v", submitted.Side)
+	if submitted.GetSide() != pb.OrderSide_BUY {
+		t.Errorf("side: want BUY, got %v", submitted.GetSide())
 	}
 }
 
@@ -93,7 +96,7 @@ func TestSubmitSellOrder(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  userID,
+		"user_id":  testSellerID,
 		"quantity": 50,
 		"price_per_share": map[string]any{
 			"amount_cents": 47600,
@@ -106,111 +109,8 @@ func TestSubmitSellOrder(t *testing.T) {
 		t.Fatalf("status: want 202, got %d", rr.Code)
 	}
 	submitted := pub.published.GetOrderSubmitted()
-	if submitted.Side != pb.OrderSide_SELL {
-		t.Errorf("side: want SELL, got %v", submitted.Side)
-	}
-}
-
-// TestMissingUserID verifies that a request without user_id is rejected with 400.
-func TestMissingUserID(t *testing.T) {
-	pub := &stubPublisher{}
-	h := producer.NewHandler(pub)
-
-	rr := post(t, h, map[string]any{
-		"quantity": 100,
-		"price_per_share": map[string]any{
-			"amount_cents": 47500,
-			"currency":     "USD",
-		},
-		"side": "BUY",
-	})
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
-	}
-	if pub.published != nil {
-		t.Error("should not publish when validation fails")
-	}
-}
-
-// TestZeroQuantity verifies that quantity=0 is rejected; you cannot submit an
-// order for zero shares.
-func TestZeroQuantity(t *testing.T) {
-	pub := &stubPublisher{}
-	h := producer.NewHandler(pub)
-
-	rr := post(t, h, map[string]any{
-		"user_id":  userID,
-		"quantity": 0,
-		"price_per_share": map[string]any{
-			"amount_cents": 47500,
-			"currency":     "USD",
-		},
-		"side": "BUY",
-	})
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
-	}
-}
-
-// TestNegativeQuantity verifies that negative share counts are rejected.
-func TestNegativeQuantity(t *testing.T) {
-	pub := &stubPublisher{}
-	h := producer.NewHandler(pub)
-
-	rr := post(t, h, map[string]any{
-		"user_id":  userID,
-		"quantity": -10,
-		"price_per_share": map[string]any{
-			"amount_cents": 47500,
-			"currency":     "USD",
-		},
-		"side": "BUY",
-	})
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
-	}
-}
-
-// TestZeroPriceCents verifies that a price of 0 cents is rejected.
-func TestZeroPriceCents(t *testing.T) {
-	pub := &stubPublisher{}
-	h := producer.NewHandler(pub)
-
-	rr := post(t, h, map[string]any{
-		"user_id":  userID,
-		"quantity": 100,
-		"price_per_share": map[string]any{
-			"amount_cents": 0,
-			"currency":     "USD",
-		},
-		"side": "BUY",
-	})
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
-	}
-}
-
-// TestInvalidSide verifies that an unrecognized side string is rejected.
-func TestInvalidSide(t *testing.T) {
-	pub := &stubPublisher{}
-	h := producer.NewHandler(pub)
-
-	rr := post(t, h, map[string]any{
-		"user_id":  userID,
-		"quantity": 100,
-		"price_per_share": map[string]any{
-			"amount_cents": 47500,
-			"currency":     "USD",
-		},
-		"side": "HOLD",
-	})
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
+	if submitted.GetSide() != pb.OrderSide_SELL {
+		t.Errorf("side: want SELL, got %v", submitted.GetSide())
 	}
 }
 
@@ -222,7 +122,7 @@ func TestOrderIDIsStableInResponse(t *testing.T) {
 	h := producer.NewHandler(pub)
 
 	rr := post(t, h, map[string]any{
-		"user_id":  userID,
+		"user_id":  testBuyerID,
 		"quantity": 100,
 		"price_per_share": map[string]any{
 			"amount_cents": 47500,
@@ -234,9 +134,77 @@ func TestOrderIDIsStableInResponse(t *testing.T) {
 	var resp map[string]string
 	json.NewDecoder(rr.Body).Decode(&resp)
 
-	eventOrderID := pub.published.GetOrderSubmitted().OrderId
+	eventOrderID := pub.published.GetOrderSubmitted().GetOrderId()
 	if resp["order_id"] != eventOrderID {
 		t.Errorf("response order_id %q does not match published event order_id %q",
 			resp["order_id"], eventOrderID)
+	}
+}
+
+// TestValidationRejectsInvalidOrders covers every input that submitOrder
+// should reject with a 400 before ever calling Publish. Each case isolates
+// exactly one invalid field, with every other field left valid, so a
+// failure here can only be coming from the field the case names, not from
+// an unrelated validation check firing first.
+func TestValidationRejectsInvalidOrders(t *testing.T) {
+	validPricePerShare := map[string]any{"amount_cents": 47500, "currency": "USD"}
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "missing user_id",
+			body: map[string]any{
+				"quantity": 100, "price_per_share": validPricePerShare, "side": "BUY",
+			},
+		},
+		{
+			name: "malformed user_id",
+			body: map[string]any{
+				"user_id": "not-a-uuid", "quantity": 100, "price_per_share": validPricePerShare, "side": "BUY",
+			},
+		},
+		{
+			name: "zero quantity",
+			body: map[string]any{
+				"user_id": testBuyerID, "quantity": 0, "price_per_share": validPricePerShare, "side": "BUY",
+			},
+		},
+		{
+			name: "negative quantity",
+			body: map[string]any{
+				"user_id": testBuyerID, "quantity": -10, "price_per_share": validPricePerShare, "side": "BUY",
+			},
+		},
+		{
+			name: "zero price",
+			body: map[string]any{
+				"user_id": testBuyerID, "quantity": 100,
+				"price_per_share": map[string]any{"amount_cents": 0, "currency": "USD"}, "side": "BUY",
+			},
+		},
+		{
+			name: "invalid side",
+			body: map[string]any{
+				"user_id": testBuyerID, "quantity": 100, "price_per_share": validPricePerShare, "side": "HOLD",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pub := &stubPublisher{}
+			h := producer.NewHandler(pub)
+
+			rr := post(t, h, tc.body)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("status: want 400, got %d", rr.Code)
+			}
+			if pub.published != nil {
+				t.Error("should not publish when validation fails")
+			}
+		})
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
+	"github.com/BennerG/exchange/internal/kafka"
 )
 
 const topicFills = "fills"
@@ -21,17 +22,9 @@ type KafkaPublisher struct {
 }
 
 func NewKafkaPublisher(brokers []string) (*KafkaPublisher, error) {
-	cfg := sarama.NewConfig()
-	cfg.Version = sarama.V3_6_0_0
-	cfg.Net.MaxOpenRequests = 1
-	cfg.Producer.RequiredAcks = sarama.WaitForAll
-	cfg.Producer.Idempotent = true
-	cfg.Producer.Return.Successes = true
-	cfg.Producer.Retry.Max = 5
-
-	p, err := sarama.NewSyncProducer(brokers, cfg)
+	p, err := kafka.NewIdempotentProducer(brokers)
 	if err != nil {
-		return nil, fmt.Errorf("create kafka producer: %w", err)
+		return nil, err
 	}
 	return &KafkaPublisher{producer: p}, nil
 }

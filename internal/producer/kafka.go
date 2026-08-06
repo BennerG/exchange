@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
+	"github.com/BennerG/exchange/internal/kafka"
 	"github.com/IBM/sarama"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,20 +19,9 @@ type KafkaPublisher struct {
 }
 
 func NewKafkaPublisher(brokers []string) (*KafkaPublisher, error) {
-	cfg := sarama.NewConfig()
-	cfg.Version = sarama.V3_6_0_0
-
-	// Idempotent producer: Kafka deduplicates retries at the broker level.
-	// Requires max.in.flight.requests.per.connection = 1 and acks = all.
-	cfg.Net.MaxOpenRequests = 1
-	cfg.Producer.RequiredAcks = sarama.WaitForAll
-	cfg.Producer.Idempotent = true
-	cfg.Producer.Return.Successes = true
-	cfg.Producer.Retry.Max = 5
-
-	p, err := sarama.NewSyncProducer(brokers, cfg)
+	p, err := kafka.NewIdempotentProducer(brokers)
 	if err != nil {
-		return nil, fmt.Errorf("create kafka producer: %w", err)
+		return nil, err
 	}
 	return &KafkaPublisher{producer: p}, nil
 }

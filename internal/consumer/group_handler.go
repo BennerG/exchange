@@ -2,13 +2,16 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
+	"github.com/BennerG/exchange/internal/store"
 )
 
 // EventHandler processes one decoded event. Matcher and Settler both
@@ -24,10 +27,11 @@ type EventHandler interface {
 // is redelivered on the next session.
 type GroupHandler struct {
 	handler EventHandler
+	dlq     DeadLetterPublisher
 }
 
-func NewGroupHandler(handler EventHandler) *GroupHandler {
-	return &GroupHandler{handler: handler}
+func NewGroupHandler(handler EventHandler, dlq DeadLetterPublisher) *GroupHandler {
+	return &GroupHandler{handler: handler, dlq: dlq}
 }
 
 func (h *GroupHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
@@ -43,32 +47,58 @@ func (h *GroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 
 			var event pb.Event
 			if err := proto.Unmarshal(message.Value, &event); err != nil {
-				// A malformed message will fail to unmarshal identically on
-				// every redelivery. Without DLQ routing in place yet, the
-				// least-bad option is to skip it rather than block the
-				// partition on a message that can never succeed.
 				log.Error().Err(err).
 					Str("topic", message.Topic).
 					Int64("offset", message.Offset).
-					Msg("failed to unmarshal event, skipping")
+					Msg("failed to unmarshal event, routing to dead letter queue")
+				h.deadLetter(session, message, fmt.Sprintf("unmarshal failed: %v", err))
+				continue
+			}
+
+			err := h.handler.HandleEvent(session.Context(), &event)
+			if err == nil {
 				session.MarkMessage(message, "")
 				session.Commit()
 				continue
 			}
 
-			if err := h.handler.HandleEvent(session.Context(), &event); err != nil {
+			if errors.Is(err, store.ErrPermanent) {
 				log.Error().Err(err).
 					Str("topic", message.Topic).
 					Int64("offset", message.Offset).
-					Msg("failed to handle event, offset not committed")
-				return fmt.Errorf("handle event: %w", err)
+					Msg("permanent failure, routing to dead letter queue")
+				h.deadLetter(session, message, err.Error())
+				continue
 			}
 
-			session.MarkMessage(message, "")
-			session.Commit()
+			log.Error().Err(err).
+				Str("topic", message.Topic).
+				Int64("offset", message.Offset).
+				Msg("failed to handle event, offset not committed")
+			return fmt.Errorf("handle event: %w", err)
 
 		case <-session.Context().Done():
 			return nil
 		}
 	}
+}
+
+func (h *GroupHandler) deadLetter(session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage, reason string) {
+	entry := DeadLetterEntry{
+		SourceTopic: message.Topic,
+		Partition:   message.Partition,
+		Offset:      message.Offset,
+		Reason:      reason,
+		Payload:     message.Value,
+		FailedAt:    time.Now(),
+	}
+	if err := h.dlq.PublishDeadLetter(session.Context(), entry); err != nil {
+		// The DLQ publish itself failed. Leaving the offset uncommitted
+		// means this message redelivers from the top, including a fresh
+		// attempt at the DLQ, rather than being silently lost entirely.
+		log.Error().Err(err).Msg("failed to publish to dead letter queue, leaving offset uncommitted")
+		return
+	}
+	session.MarkMessage(message, "")
+	session.Commit()
 }

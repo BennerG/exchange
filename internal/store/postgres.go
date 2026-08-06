@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -46,20 +47,16 @@ func (p *PostgresStore) SettleFill(ctx context.Context, trade Trade) error {
 		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7)
 	`, trade.TradeID, trade.BuyOrderID, trade.SellOrderID, trade.BuyerUserID, trade.SellerUserID, trade.Quantity, trade.PriceCents)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolationCode {
-			return ErrAlreadySettled
-		}
-		return fmt.Errorf("insert transaction: %w", err)
+		return classifyPgError("insert transaction", err)
 	}
 
 	amountCents := trade.Quantity * trade.PriceCents
 
 	if err := upsertAccount(ctx, tx, trade.BuyerUserID, -amountCents, trade.Quantity); err != nil {
-		return fmt.Errorf("update buyer account: %w", err)
+		return classifyPgError("update buyer account", err)
 	}
 	if err := upsertAccount(ctx, tx, trade.SellerUserID, amountCents, -trade.Quantity); err != nil {
-		return fmt.Errorf("update seller account: %w", err)
+		return classifyPgError("update seller account", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -92,4 +89,21 @@ func (p *PostgresStore) Balance(ctx context.Context, userID string) (cashCents, 
 		return 0, 0, nil
 	}
 	return cashCents, sharesQQQ, err
+}
+
+func classifyPgError(context string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if pgErr.Code == uniqueViolationCode {
+			return ErrAlreadySettled
+		}
+		// Class 22, data exception, and class 23, integrity constraint
+		// violation, both mean the data itself is invalid, not that the
+		// connection or the moment in time was unlucky. Excludes 23505,
+		// the unique violation already handled above as a distinct case.
+		if strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23") {
+			return fmt.Errorf("%s: %w: %w", context, ErrPermanent, err)
+		}
+	}
+	return fmt.Errorf("%s: %w", context, err)
 }

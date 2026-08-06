@@ -29,8 +29,14 @@ func main() {
 	}
 	defer pub.Close()
 
+	dlqPub, err := consumer.NewKafkaDeadLetterPublisher(brokers)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create dead letter publisher")
+	}
+	defer dlqPub.Close()
+
 	matcher := consumer.NewMatcher(pub)
-	handler := consumer.NewGroupHandler(matcher)
+	handler := consumer.NewGroupHandler(matcher, dlqPub)
 
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V3_6_0_0

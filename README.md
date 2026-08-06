@@ -86,11 +86,19 @@ curl -X POST localhost:8080/orders \
 The second request crosses the spread, and the trade settles into Postgres within a second or two. Verify it landed:
 
 ```bash
-psql "postgresql://postgres:postgres@localhost:5432/exchange" -c "SELECT * FROM transactions;"
-psql "postgresql://postgres:postgres@localhost:5432/exchange" -c "SELECT * FROM accounts;"
+psql "postgresql://exchange:exchange@localhost:5432/exchange" -c "SELECT * FROM transactions;"
+psql "postgresql://exchange:exchange@localhost:5432/exchange" -c "SELECT * FROM accounts;"
 ```
 
-**Current status:** the full pipeline runs end to end, REST submission, idempotent Kafka publish, order matching, exactly-once settlement into PostgreSQL with correct double-entry balances. The matcher's produce step is idempotent but not yet wrapped in a Kafka transaction, see [Known limitation](#known-limitation-the-matchers-order-book-is-not-yet-idempotent-against-redelivery) below. DLQ routing for malformed or unrecoverable messages is not yet built.
+To test the unmarshal failure path to the dead letter queue, send invalid data to the `matcher`.
+
+```bash
+echo "this is not valid protobuf" | docker exec -i exchange-kafka kafka-console-producer --broker-list localhost:9092 --topic orders
+```
+
+And you should see that error show up in the logs.
+
+**Current status:** the full pipeline runs end to end, REST submission, idempotent Kafka publish, order matching, exactly-once settlement into PostgreSQL with correct double-entry balances. The matcher's produce step is idempotent but not yet wrapped in a Kafka transaction, see [Known limitation](#known-limitation-the-matchers-order-book-is-not-yet-idempotent-against-redelivery) below.
 
 ### Running tests
 

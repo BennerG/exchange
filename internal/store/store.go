@@ -11,6 +11,13 @@ import (
 // signals a safe redelivery rather than a genuine settlement problem.
 var ErrAlreadySettled = errors.New("trade already settled")
 
+// ErrPermanent marks a settlement failure that will fail identically on
+// every retry, such as input that violates a data type or constraint at
+// the database level. Callers should route a permanent failure to a dead
+// letter queue rather than retrying it indefinitely. Check with errors.Is,
+// since a concrete error is wrapped around this sentinel, not replaced by it.
+var ErrPermanent = errors.New("permanent settlement failure")
+
 // Trade is one completed match between a buyer and a seller, ready to be
 // recorded against both accounts atomically.
 type Trade struct {

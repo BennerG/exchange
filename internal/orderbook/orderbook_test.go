@@ -240,3 +240,122 @@ func TestBuyAboveAskFillsAtAskPrice(t *testing.T) {
 		t.Errorf("fill price should be ask price 15000, got %d", fills[0].PriceCents)
 	}
 }
+
+// TestMatchDoesNotRestIncomingOrder verifies that Match alone, without a
+// following Apply, never makes the incoming order visible to a future
+// match or cancellable, since resting is deliberately deferred to Apply.
+func TestMatchDoesNotRestIncomingOrder(t *testing.T) {
+	b := orderbook.New()
+	b.Add(order("sell-1", "user-s", orderbook.Sell, 50, 15000, 0))
+
+	buyOrder := order("buy-1", "user-b", orderbook.Buy, 100, 15000, 1)
+	outcome := b.Match(buyOrder)
+
+	if len(outcome.Fills) != 1 {
+		t.Fatalf("expected 1 fill, got %d", len(outcome.Fills))
+	}
+	if b.Cancel("buy-1") {
+		t.Error("incoming order should not be cancellable before Apply, it was never resting")
+	}
+}
+
+// TestDiscardFullyReversesAMatch verifies that Match followed by Discard
+// leaves the book in a state indistinguishable, by external behavior,
+// from Match never having been called: a retry with a fresh Order, the
+// same shape a redelivered event would produce, matches identically.
+func TestDiscardFullyReversesAMatch(t *testing.T) {
+	b := orderbook.New()
+	b.Add(order("sell-1", "user-s", orderbook.Sell, 100, 15000, 0))
+
+	firstAttempt := order("buy-1", "user-b", orderbook.Buy, 40, 15000, 1)
+	outcome := b.Match(firstAttempt)
+	if len(outcome.Fills) != 1 {
+		t.Fatalf("expected 1 fill on first attempt, got %d", len(outcome.Fills))
+	}
+	b.Discard(outcome)
+
+	retry := order("buy-1", "user-b", orderbook.Buy, 40, 15000, 1)
+	fills := b.Add(retry)
+
+	if len(fills) != 1 {
+		t.Fatalf("expected 1 fill on retry, got %d", len(fills))
+	}
+	if fills[0].Quantity != 40 {
+		t.Errorf("retry quantity: want 40, got %d", fills[0].Quantity)
+	}
+	if fills[0].SellRemaining != 60 {
+		t.Errorf("seller remaining after retry: want 60, got %d", fills[0].SellRemaining)
+	}
+}
+
+// TestDiscardRestoresAFullyConsumedCounterparty verifies that when Match
+// fully consumes and pops a counterparty, Discard pushes it back onto
+// the book, available again, not left permanently gone.
+func TestDiscardRestoresAFullyConsumedCounterparty(t *testing.T) {
+	b := orderbook.New()
+	b.Add(order("sell-1", "user-s", orderbook.Sell, 40, 15000, 0))
+
+	attempt := order("buy-1", "user-b", orderbook.Buy, 40, 15000, 1)
+	outcome := b.Match(attempt)
+	if len(outcome.Fills) != 1 {
+		t.Fatalf("expected 1 fill, got %d", len(outcome.Fills))
+	}
+	b.Discard(outcome)
+
+	retry := order("buy-2", "user-b2", orderbook.Buy, 40, 15000, 2)
+	fills := b.Add(retry)
+	if len(fills) != 1 {
+		t.Fatalf("expected sell-1 to be available again, got %d fills", len(fills))
+	}
+	if fills[0].SellOrderID != "sell-1" {
+		t.Errorf("expected sell-1 to be the counterparty again, got %s", fills[0].SellOrderID)
+	}
+}
+
+// TestDiscardAcrossMultipleCounterparties verifies that a match sweeping
+// several resting orders is fully reversible: every popped counterparty
+// and the one partially-filled counterparty that ended the loop all
+// return to exactly their prior state.
+func TestDiscardAcrossMultipleCounterparties(t *testing.T) {
+	b := orderbook.New()
+	b.Add(order("sell-1", "user-s1", orderbook.Sell, 40, 15000, 0))
+	b.Add(order("sell-2", "user-s2", orderbook.Sell, 30, 15000, 1))
+	b.Add(order("sell-3", "user-s3", orderbook.Sell, 30, 15000, 2))
+
+	attempt := order("buy-1", "user-b", orderbook.Buy, 100, 15000, 3)
+	outcome := b.Match(attempt)
+	if len(outcome.Fills) != 3 {
+		t.Fatalf("expected 3 fills, got %d", len(outcome.Fills))
+	}
+	b.Discard(outcome)
+
+	retry := order("buy-2", "user-b2", orderbook.Buy, 100, 15000, 4)
+	fills := b.Add(retry)
+
+	var totalQty int64
+	for _, f := range fills {
+		totalQty += f.Quantity
+	}
+	if totalQty != 100 {
+		t.Errorf("expected the full 100 to match again identically, got %d", totalQty)
+	}
+	if len(fills) != 3 {
+		t.Errorf("expected the same 3 counterparties again, got %d fills", len(fills))
+	}
+}
+
+// TestApplyRestsIncomingOrderWithRemainder verifies the ordinary success
+// path: Match followed by Apply rests whatever quantity is left over,
+// exactly as Add always has.
+func TestApplyRestsIncomingOrderWithRemainder(t *testing.T) {
+	b := orderbook.New()
+	b.Add(order("sell-1", "user-s", orderbook.Sell, 40, 15000, 0))
+
+	buyOrder := order("buy-1", "user-b", orderbook.Buy, 100, 15000, 1)
+	outcome := b.Match(buyOrder)
+	b.Apply(outcome)
+
+	if !b.Cancel("buy-1") {
+		t.Error("expected buy-1 to be resting and cancellable after Apply")
+	}
+}

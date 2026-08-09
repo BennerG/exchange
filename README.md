@@ -15,14 +15,14 @@ flowchart LR
     Client[REST client] -->|POST /orders| Producer[Producer service]
     Producer -->|OrderSubmitted| OrdersTopic[(Kafka: orders)]
     OrdersTopic --> Matcher[Matcher consumer]
-    Matcher -->|Filled, one per trade| FillsTopic[(Kafka: fills)]
-    Matcher -.->|planned| DLQ[(Kafka: DLQ)]
+    Matcher -->|Filled, one per trade, transactional| FillsTopic[(Kafka: fills)]
+    Matcher -->|unmarshal or permanent failures| DLQ[(Kafka: dlq)]
     FillsTopic --> Settler[Settler consumer]
     Settler -->|SettleFill| Postgres[(PostgreSQL ledger)]
-    Settler -.->|planned| DLQ
+    Settler -->|unmarshal or permanent failures| DLQ
 ```
 
-The producer accepts orders over REST, validates them, and publishes an `OrderSubmitted` event to Kafka with an idempotent producer configuration. The matcher consumes those events, runs them through an in-memory order book, and publishes one `Filled` event per trade for every match produced. The settler consumes `Filled` events and writes them into PostgreSQL, one trade per row, with the row's primary key doubling as the idempotency guard against redelivery.
+The producer accepts orders over REST, validates them, and publishes an `OrderSubmitted` event to Kafka with an idempotent producer configuration. The matcher consumes those events, runs them through an in-memory order book, and produces one `Filled` event per trade for every match, with the match, the produce, and the offset commit all wrapped in a single Kafka transaction. The settler consumes `Filled` events and writes them into PostgreSQL, one trade per row, with the row's primary key doubling as the idempotency guard against redelivery. Messages that fail unrecoverably at either stage route to a shared dead letter queue instead of retrying forever.
 
 ## Tech stack
 
@@ -90,15 +90,15 @@ psql "postgresql://exchange:exchange@localhost:5432/exchange" -c "SELECT * FROM 
 psql "postgresql://exchange:exchange@localhost:5432/exchange" -c "SELECT * FROM accounts;"
 ```
 
-To test the unmarshal failure path to the dead letter queue, send invalid data to the `matcher`.
+To test the unmarshal failure path to the dead letter queue, send invalid data to the `matcher`:
 
 ```bash
 echo "this is not valid protobuf" | docker exec -i exchange-kafka kafka-console-producer --broker-list localhost:9092 --topic orders
 ```
 
-And you should see that error show up in the logs.
+And you should see that error show up in the logs, followed by an entry on the `dlq` topic.
 
-**Current status:** the full pipeline runs end to end, REST submission, idempotent Kafka publish, order matching, exactly-once settlement into PostgreSQL with correct double-entry balances. The matcher's produce step is idempotent but not yet wrapped in a Kafka transaction, see [Known limitation](#known-limitation-the-matchers-order-book-is-not-yet-idempotent-against-redelivery) below.
+**Current status:** the full pipeline runs end to end, REST submission, idempotent Kafka publish, order matching, and exactly-once settlement into PostgreSQL with correct double-entry balances. The matcher's match, produce, and offset commit are fully transactional: a failure at any point, including a failure in the final commit itself, leaves both the order book and Kafka in their prior state, and a redelivered order matches identically to the first attempt. DLQ routing is live on both consumers, permanent Postgres failures and malformed messages are dead-lettered rather than retried forever. Order book state does not yet survive a process restart; see [Known limitation](#known-limitation-the-order-book-has-no-persistence) below.
 
 ### Running tests
 
@@ -113,17 +113,18 @@ go test ./... -race
 ```
 exchange/
 ├── cmd/
-│   ├── matcher               # matcher service entrypoint
-│   ├── producer              # producer service entrypoint
-│   └── settler               # settler service entrypoint
+│   ├── matcher              # matcher service entrypoint
+│   ├── producer             # producer service entrypoint
+│   └── settler              # settler service entrypoint
 ├── internal/
-│   ├── orderbook/            # price-time priority matching engine, pure in-memory
-│   ├── producer/             # REST handler, Kafka publisher
-│   ├── consumer/             # matcher and settler
-│   └── store/                # Store interface, in-memory and Postgres implementations
-├── proto/trading/events/   # protobuf schema
-├── migrations/             # PostgreSQL schema
-├── docker-compose.yml      # Kafka (KRaft), Schema Registry, PostgreSQL, Prometheus
+│   ├── orderbook/           # price-time priority matching engine, pure in-memory
+│   ├── producer/            # REST handler, Kafka publisher
+│   ├── consumer/            # matcher, settler, group handlers, dead letter routing
+│   ├── kafka/               # shared idempotent and transactional producer configuration
+│   └── store/               # Store interface, in-memory and Postgres implementations
+├── proto/trading/events/  # protobuf schema
+├── migrations/            # PostgreSQL schema
+├── docker-compose.yml     # Kafka (KRaft), Schema Registry, PostgreSQL, Prometheus
 └── scripts/prometheus.yml
 ```
 
@@ -157,19 +158,19 @@ The settler and the matcher solve exactly-once in genuinely different ways, beca
 
 The settler reads a `Filled` event and writes to an external system, PostgreSQL, that isn't Kafka. Its guarantee comes from committing the Kafka offset only after the database transaction commits, combined with `trade_id` as a database primary key. A redelivered message hits the primary key constraint, returns `ErrAlreadySettled`, and the settler treats that as a safe no-op rather than a failure.
 
-The matcher reads an `OrderSubmitted` event and also produces new events, `Filled`, as a result. This is the shape Kafka's own transactional producer API exists for, consume, transform, produce, and commit the offset as one atomic unit, with downstream consumers reading with `isolation.level=read_committed` so they never see output from an aborted transaction. This is not yet implemented; see the known limitation below.
+The matcher reads an `OrderSubmitted` event and also produces new events, `Filled`, as a result. Kafka's transactional producer API, `BeginTxn`, `AddMessageToTxn`, `CommitTxn`, makes consume, produce, and offset commit one atomic unit, with the settler reading `fills` at `isolation.level=read_committed` so it never sees output from an aborted transaction. Getting this fully correct required one more layer than the Kafka transaction alone provides; see [Resolved: the matcher's match and produce are fully atomic](#resolved-the-matchers-match-and-produce-are-fully-atomic) below.
 
-### Known limitation: the matcher's order book is not yet idempotent against redelivery
+### Resolved: the matcher's match and produce are fully atomic
 
-The order book is in-memory, mutable state scoped to a single matcher process. Every call to `book.Add` permanently changes which orders are resting, so matching is not a pure function the way settlement is.
+This gap went through two passes before it was actually closed. I'll explain a bit of my first fix to provide context for the fix that exists with this latest update.
 
-If a Kafka transaction wrapping consume, match, produce, and commit were to abort partway through, for example because publishing the second of three resulting fills failed, the offset never commits and Kafka redelivers the same `OrderSubmitted` event. The order book has already been mutated by the failed attempt, so re-running `Add` on the redelivered order matches against a book that has already partially advanced, and can produce different fills the second time through.
+The order book is in-memory, mutable state, so a redelivered `OrderSubmitted` after a partial failure could match against a book already altered by the failed attempt. The first fix wrapped Kafka produce and offset commit in a transaction, `BeginTxn`, `AddMessageToTxn`, `CommitTxn`. That closed the Kafka-side half of the problem, a `read_committed` consumer would never see a partial, inconsistent batch of fills. It did not close the in-memory half: `book.Add` still mutated the real book before the transaction's outcome was known, so a failure in `CommitTxn` itself, after every fill had already published successfully, could still leave the book reflecting a match Kafka never actually finalized.
 
-This is a known limitation of the current scope, not a solved problem. Two candidate fixes are listed under [What's Next](#whats-next).
+The real fix splits what used to be one operation, `Add`, into three. `Book.Match` computes a match and mutates counterparty orders for real, immediately, but deliberately never rests the incoming order itself. `Book.Apply` rests it, the one remaining step. `Book.Discard` fully reverses everything `Match` did: every counterparty it popped is pushed back, every partial fill it applied is subtracted back off, and the incoming order's own `Filled` resets to zero. `TransactionalGroupHandler` calls `Apply` only once `CommitTxn` has actually returned success, and `Discard` on every other exit path, including a failed `CommitTxn`. A redelivered order after any failure, at any point in that sequence, matches against a book in exactly the state it was in before the failed attempt ever ran.
 
 ### Known limitation: the order book has no persistence
 
-A crashed matcher process loses every resting order along with it, since the book exists only in memory. There is currently no mechanism to reconstruct book state on restart.
+A crashed matcher process loses every resting order along with it, since the book exists only in memory. There is currently no mechanism to reconstruct book state on restart. `pending_orders` already exists in the schema for this; see [What's Next](#whats-next).
 
 ### pgx direct, not database/sql
 
@@ -185,16 +186,26 @@ Testing the full pipeline end to end for the first time surfaced a real failure 
 
 Because the settler only commits a Kafka offset after a message settles successfully, and this message could never succeed no matter how many times it retried, it entered a permanent retry loop, once a second, forever. On a single partition, every trade behind it in the topic was silently blocked too. Nothing crashed and nothing alerted; the pipeline just quietly stopped making progress, arguably a more dangerous failure mode than a crash, since nothing prompts anyone to notice.
 
-The fix has two parts. UUID validation was added at the REST boundary, so malformed input now fails fast with a 400 instead of propagating three services deep. And the incident exposed a real gap in the consumer's error handling: it currently only distinguishes malformed bytes (skip and log) from every other failure (retry), but this was a third case, structurally valid data guaranteed to fail deterministically, which needs its own path rather than being retried alongside genuinely transient failures. That distinction is part of the DLQ design work listed under [What's Next](#whats-next).
+The fix has two parts. UUID validation was added at the REST boundary, so malformed input now fails fast with a 400 instead of propagating three services deep. And the incident exposed a real gap in the consumer's error handling: it only distinguished malformed bytes (skip and log) from every other failure (retry), but this was a third case, structurally valid data guaranteed to fail deterministically, which needed its own path rather than being retried alongside genuinely transient failures. That distinction led directly to the DLQ design below.
+
+### A single dead letter queue, JSON not Protobuf
+
+Both consumers route unrecoverable messages to one shared `dlq` topic rather than separate topics per source, with the originating topic, partition, and offset carried in the envelope so nothing is lost by sharing. The envelope itself is plain JSON, not another Protobuf schema: a dead letter entry is an operational artifact meant for a human to inspect while debugging, not a domain contract other services agree on, so it doesn't need schema registry involvement.
+
+Two distinct failure classes route here. A message that fails to unmarshal at all is dead-lettered immediately, since corrupted bytes fail identically on every retry. A settlement failure wrapping `store.ErrPermanent`, currently certain Postgres data and constraint errors, routes here too, since those are also guaranteed to fail on every retry. Genuinely transient failures, a database or broker briefly unreachable, are left uncommitted for ordinary Kafka redelivery instead. The classification logic lives in exactly one place, `postgres.go`, the only file that actually knows what a given Postgres error code means; the consumer group handlers only ever check `errors.Is(err, store.ErrPermanent)`, with zero database-specific knowledge of their own.
+
+The matcher does not yet have its own permanent-failure classification, since its only realistic failure today is a Kafka publish itself failing, which is transient by nature; every match attempt currently aborts and retries rather than being dead-lettered. See [What's Next](#whats-next).
+
+### One idempotent producer constructor, not three copies
+
+`internal/kafka.NewIdempotentProducer` and `NewTransactionalProducer` hold the sarama configuration every publisher in this project needs, `MaxOpenRequests`, `RequiredAcks`, `Idempotent`, `Retry.Max`. This was deliberately duplicated across the order producer and the fills publisher at first, on the rule that duplication earns being extracted on its third occurrence, not its second. The dead letter publisher was that third occurrence, and the shared constructor came out of it.
 
 ## What's Next
 
-- **Full Kafka transactional produce for the matcher**, `BeginTxn`, `AddOffsetsToTxn`, `CommitTxn`, so consume, match, produce, and offset commit become one atomic unit and the redelivery gap below is fully closed. The matcher currently uses a simpler pattern, idempotent produce plus manual offset commit after publish succeeds, which runs correctly end to end but does not fully close the gap.
-- **Order book persistence**, so a crashed matcher can reconstruct resting orders on restart rather than losing them.
-- **DLQ routing** for messages that fail processing in either consumer, including a dedicated path for input that is structurally valid but will deterministically fail every retry, distinct from genuinely transient failures.
+- **Matcher failure classification.** The matcher currently treats every failure as transient and retries. Its only real failure mode today is a Kafka publish itself failing, but a dedicated classification, mirroring `store.ErrPermanent`, would be worth adding if a genuinely unrecoverable matcher failure mode ever appears.
+- **Order book persistence**, so a crashed matcher can reconstruct resting orders on restart rather than losing them. `pending_orders` already exists in the schema for this.
 - **Prometheus metrics and a Grafana dashboard**: order latency, fill rate, consumer lag, DLQ count.
 - **Multi-stock support**, partitioning by `stock_id`, one order book per partition.
 - **Per-order notification events** (`Filled` from a single order's perspective, alongside the current trade-based event), for a future live fill notification feature.
 - **An automated trading client**, as an ordinary producer client submitting orders through the existing REST API based on a learned strategy, consuming historical or live price data. This would live entirely outside Exchange's own code.
-- **Table-driven refactor** of the producer's rejection-case tests into one table-driven test.
 - A possible reimplementation of the matching engine in Rust or C++ down the line, once the Go version is complete, to compare latency characteristics directly against a garbage collected runtime.

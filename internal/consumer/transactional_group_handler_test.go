@@ -11,10 +11,29 @@ import (
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 )
 
+// fakeTransactionalEventHandler lets each test control exactly what
+// Prepare returns, and records whether commit or discard actually ran,
+// which is the entire behavior this handler exists to get right.
+type fakeTransactionalEventHandler struct {
+	toPublish []*pb.Event
+	err       error
+
+	committed bool
+	discarded bool
+}
+
+func (f *fakeTransactionalEventHandler) Prepare(_ context.Context, _ *pb.Event) ([]*pb.Event, func(), func(), error) {
+	if f.err != nil {
+		return nil, nil, nil, f.err
+	}
+	commit := func() { f.committed = true }
+	discard := func() { f.discarded = true }
+	return f.toPublish, commit, discard, nil
+}
+
 // fakeTransactionalPublisher records every transaction control call it
 // receives, or returns a configured error for whichever one a test wants
-// to fail, letting tests assert on exactly which calls fired and in what
-// combination, without a real Kafka transaction coordinator involved.
+// to fail.
 type fakeTransactionalPublisher struct {
 	publishErr    error
 	beginErr      error
@@ -54,14 +73,15 @@ func (f *fakeTransactionalPublisher) AbortTxn() error {
 	return f.abortErr
 }
 
-// TestTransactionalConsumeClaimCommitsOnSuccess verifies the ordinary path:
-// BeginTxn, a successful HandleEvent, AddMessageToTxn folding the consumed
-// offset in, then CommitTxn, with no AbortTxn and, critically, no direct
-// session.MarkMessage or session.Commit call at all, since the offset
-// commit happens entirely through the transaction, not through the group
-// coordinator directly.
+func fillPayload() *pb.Event {
+	return &pb.Event{Payload: &pb.Event_Filled{Filled: &pb.Filled{TradeId: "trade-1"}}}
+}
+
+// TestTransactionalConsumeClaimCommitsOnSuccess verifies the ordinary
+// path: BeginTxn, every event published, AddMessageToTxn, CommitTxn, and
+// only then commit, never discard.
 func TestTransactionalConsumeClaimCommitsOnSuccess(t *testing.T) {
-	handler := &fakeEventHandler{err: nil}
+	handler := &fakeTransactionalEventHandler{toPublish: []*pb.Event{fillPayload()}}
 	pub := &fakeTransactionalPublisher{}
 	dlq := &fakeDeadLetterPublisher{}
 	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
@@ -78,50 +98,20 @@ func TestTransactionalConsumeClaimCommitsOnSuccess(t *testing.T) {
 		t.Errorf("want begin=1 add=1 commit=1 abort=0, got begin=%d add=%d commit=%d abort=%d",
 			pub.begun, pub.added, pub.committed, pub.aborted)
 	}
-	if session.marked != 0 || session.commits != 0 {
-		t.Errorf("want no direct session commit for the transactional path, got %d marks and %d commits",
-			session.marked, session.commits)
+	if len(pub.published) != 1 {
+		t.Errorf("want 1 event published, got %d", len(pub.published))
+	}
+	if !handler.committed || handler.discarded {
+		t.Error("want the matcher's commit called, not discard")
 	}
 }
 
-// TestTransactionalConsumeClaimUnmarshalFailureSkipsTransaction verifies
-// that a message which never decodes goes straight to the dead letter
-// queue via the same direct session commit GroupHandler uses, without
-// ever opening a transaction, since nothing was, or ever will be,
-// produced for a message that was never successfully read.
-func TestTransactionalConsumeClaimUnmarshalFailureSkipsTransaction(t *testing.T) {
-	handler := &fakeEventHandler{}
-	pub := &fakeTransactionalPublisher{}
-	dlq := &fakeDeadLetterPublisher{}
-	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
-
-	session := &fakeSession{ctx: context.Background()}
-	claim := newClaimWithMessages(&sarama.ConsumerMessage{
-		Topic: "orders", Offset: 9, Value: []byte{0xFF, 0xFF, 0xFF},
-	})
-
-	if err := gh.ConsumeClaim(session, claim); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if pub.begun != 0 {
-		t.Errorf("want no transaction opened for an unmarshal failure, got begun=%d", pub.begun)
-	}
-	if len(dlq.entries) != 1 {
-		t.Fatalf("want 1 dead letter entry, got %d", len(dlq.entries))
-	}
-	if session.marked != 1 || session.commits != 1 {
-		t.Errorf("want offset committed directly past the bad message, got %d marks and %d commits",
-			session.marked, session.commits)
-	}
-}
-
-// TestTransactionalConsumeClaimAbortsOnHandleEventFailure verifies that a
-// HandleEvent failure aborts the open transaction, never calls
-// AddMessageToTxn or CommitTxn, and leaves the offset uncommitted so the
-// message redelivers.
-func TestTransactionalConsumeClaimAbortsOnHandleEventFailure(t *testing.T) {
-	handler := &fakeEventHandler{err: errors.New("publish to fills failed")}
-	pub := &fakeTransactionalPublisher{}
+// TestTransactionalConsumeClaimDiscardsOnPublishFailure verifies that a
+// publish failure discards the matcher's in-memory match, aborts the
+// Kafka transaction, and never calls commit.
+func TestTransactionalConsumeClaimDiscardsOnPublishFailure(t *testing.T) {
+	handler := &fakeTransactionalEventHandler{toPublish: []*pb.Event{fillPayload()}}
+	pub := &fakeTransactionalPublisher{publishErr: errors.New("broker unavailable")}
 	dlq := &fakeDeadLetterPublisher{}
 	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
 
@@ -131,27 +121,23 @@ func TestTransactionalConsumeClaimAbortsOnHandleEventFailure(t *testing.T) {
 	})
 
 	if err := gh.ConsumeClaim(session, claim); err == nil {
-		t.Fatal("want an error returned when HandleEvent fails inside the transaction")
+		t.Fatal("want an error when publish fails")
 	}
-	if pub.begun != 1 || pub.aborted != 1 {
-		t.Errorf("want begin=1 abort=1, got begin=%d abort=%d", pub.begun, pub.aborted)
+	if pub.aborted != 1 || pub.committed != 0 {
+		t.Errorf("want abort=1 commit=0, got abort=%d commit=%d", pub.aborted, pub.committed)
 	}
-	if pub.added != 0 || pub.committed != 0 {
-		t.Errorf("want AddMessageToTxn and CommitTxn never called, got added=%d committed=%d",
-			pub.added, pub.committed)
-	}
-	if session.marked != 0 || session.commits != 0 {
-		t.Errorf("want offset left uncommitted, got %d marks and %d commits", session.marked, session.commits)
+	if !handler.discarded || handler.committed {
+		t.Error("want the matcher's discard called, not commit")
 	}
 }
 
-// TestTransactionalConsumeClaimAbortsOnAddMessageFailure verifies that a
-// failure folding the consumed offset into the transaction, after
-// HandleEvent already succeeded, still aborts cleanly rather than
-// committing a transaction with an incomplete offset record.
-func TestTransactionalConsumeClaimAbortsOnAddMessageFailure(t *testing.T) {
-	handler := &fakeEventHandler{err: nil}
-	pub := &fakeTransactionalPublisher{addMessageErr: errors.New("add offsets to txn failed")}
+// TestTransactionalConsumeClaimDiscardsOnCommitTxnFailure verifies the
+// specific scenario this whole redesign closes: every publish succeeds,
+// but CommitTxn itself fails, and the matcher's discard still runs, so
+// the book is never left reflecting a match Kafka never finalized.
+func TestTransactionalConsumeClaimDiscardsOnCommitTxnFailure(t *testing.T) {
+	handler := &fakeTransactionalEventHandler{toPublish: []*pb.Event{fillPayload()}}
+	pub := &fakeTransactionalPublisher{commitErr: errors.New("broker unavailable during commit")}
 	dlq := &fakeDeadLetterPublisher{}
 	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
 
@@ -161,22 +147,23 @@ func TestTransactionalConsumeClaimAbortsOnAddMessageFailure(t *testing.T) {
 	})
 
 	if err := gh.ConsumeClaim(session, claim); err == nil {
-		t.Fatal("want an error returned when AddMessageToTxn fails")
+		t.Fatal("want an error when CommitTxn fails")
 	}
-	if pub.aborted != 1 || pub.committed != 0 {
-		t.Errorf("want abort=1 commit=0, got abort=%d commit=%d", pub.aborted, pub.committed)
+	if !handler.discarded || handler.committed {
+		t.Error("want discard called even though every publish succeeded, since the commit itself failed")
+	}
+	if pub.aborted != 0 {
+		t.Errorf("want no AbortTxn call after a failed CommitTxn, got %d", pub.aborted)
 	}
 }
 
-// TestTransactionalConsumeClaimReturnsErrorOnCommitFailure documents the
-// current, deliberate behavior when CommitTxn itself fails: the error
-// propagates directly, with no explicit AbortTxn call, since the
-// transaction is no longer in a state where beginning a fresh abort makes
-// sense. The offset stays uncommitted either way, so the message still
-// redelivers.
-func TestTransactionalConsumeClaimReturnsErrorOnCommitFailure(t *testing.T) {
-	handler := &fakeEventHandler{err: nil}
-	pub := &fakeTransactionalPublisher{commitErr: errors.New("broker unavailable during commit")}
+// TestTransactionalConsumeClaimDiscardsOnPrepareThenBeginTxnFailure
+// verifies that a BeginTxn failure still discards, even though nothing
+// Kafka-related ever started, since Prepare's internal mutation already
+// happened before BeginTxn was ever called.
+func TestTransactionalConsumeClaimDiscardsOnBeginTxnFailure(t *testing.T) {
+	handler := &fakeTransactionalEventHandler{toPublish: []*pb.Event{fillPayload()}}
+	pub := &fakeTransactionalPublisher{beginErr: errors.New("producer fenced")}
 	dlq := &fakeDeadLetterPublisher{}
 	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
 
@@ -186,10 +173,41 @@ func TestTransactionalConsumeClaimReturnsErrorOnCommitFailure(t *testing.T) {
 	})
 
 	if err := gh.ConsumeClaim(session, claim); err == nil {
-		t.Fatal("want an error returned when CommitTxn fails")
+		t.Fatal("want an error when BeginTxn fails")
 	}
-	if pub.added != 1 || pub.committed != 1 || pub.aborted != 0 {
-		t.Errorf("want added=1 committed=1 aborted=0, got added=%d committed=%d aborted=%d",
-			pub.added, pub.committed, pub.aborted)
+	if !handler.discarded || handler.committed {
+		t.Error("want discard called even though BeginTxn never succeeded")
+	}
+	if pub.published != nil {
+		t.Error("want nothing published when BeginTxn fails first")
+	}
+}
+
+// TestTransactionalConsumeClaimUnmarshalFailureNeverCallsPrepare verifies
+// that a message which never decodes goes straight to the dead letter
+// queue without ever reaching Prepare, so there is nothing to commit or
+// discard at all.
+func TestTransactionalConsumeClaimUnmarshalFailureNeverCallsPrepare(t *testing.T) {
+	handler := &fakeTransactionalEventHandler{}
+	pub := &fakeTransactionalPublisher{}
+	dlq := &fakeDeadLetterPublisher{}
+	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
+
+	session := &fakeSession{ctx: context.Background()}
+	claim := newClaimWithMessages(&sarama.ConsumerMessage{
+		Topic: "orders", Offset: 4, Value: []byte{0xFF, 0xFF, 0xFF},
+	})
+
+	if err := gh.ConsumeClaim(session, claim); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handler.committed || handler.discarded {
+		t.Error("want neither commit nor discard called, Prepare should never have been reached")
+	}
+	if pub.begun != 0 {
+		t.Errorf("want no transaction opened for an unmarshal failure, got begun=%d", pub.begun)
+	}
+	if len(dlq.entries) != 1 {
+		t.Fatalf("want 1 dead letter entry, got %d", len(dlq.entries))
 	}
 }

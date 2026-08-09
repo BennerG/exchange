@@ -2,27 +2,11 @@ package consumer_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/BennerG/exchange/internal/consumer"
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 )
-
-// stubPublisher records every event published across a single HandleEvent
-// call, since one order can produce several Filled events at once.
-type stubPublisher struct {
-	published []*pb.Event
-	err       error
-}
-
-func (s *stubPublisher) Publish(_ context.Context, event *pb.Event) error {
-	if s.err != nil {
-		return s.err
-	}
-	s.published = append(s.published, event)
-	return nil
-}
 
 func orderSubmitted(orderID, userID string, side pb.OrderSide, qty, priceCents int64) *pb.Event {
 	return &pb.Event{
@@ -41,125 +25,155 @@ func orderSubmitted(orderID, userID string, side pb.OrderSide, qty, priceCents i
 	}
 }
 
-// TestHandleEventMatchesRestingOrder verifies that a crossing order produces
-// exactly one Filled event, priced at the resting order's limit.
-func TestHandleEventMatchesRestingOrder(t *testing.T) {
-	pub := &stubPublisher{}
-	m := consumer.NewMatcher(pub)
+// TestPrepareMatchesRestingOrder verifies that a crossing order produces
+// exactly one fill to publish, priced at the resting order's limit, and
+// that calling commit is what makes the incoming order visible to a
+// later Prepare call.
+func TestPrepareMatchesRestingOrder(t *testing.T) {
+	m := consumer.NewMatcher()
 
-	if err := m.HandleEvent(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15000)); err != nil {
+	_, commitSell, _, err := m.Prepare(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15000))
+	if err != nil {
 		t.Fatalf("seed sell: unexpected error: %v", err)
 	}
-	if err := m.HandleEvent(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000)); err != nil {
+	commitSell()
+
+	toPublish, commitBuy, _, err := m.Prepare(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000))
+	if err != nil {
 		t.Fatalf("submit buy: unexpected error: %v", err)
 	}
+	commitBuy()
 
-	if len(pub.published) != 1 {
-		t.Fatalf("want 1 published event, got %d", len(pub.published))
+	if len(toPublish) != 1 {
+		t.Fatalf("want 1 event to publish, got %d", len(toPublish))
 	}
-	filled := pub.published[0].GetFilled()
+	filled := toPublish[0].GetFilled()
 	if filled == nil {
 		t.Fatal("want a Filled event")
 	}
-	if filled.TradeId == "" {
+	if filled.GetTradeId() == "" {
 		t.Error("want a non-empty trade_id")
 	}
-	if filled.BuyOrderId != "buy-1" || filled.SellOrderId != "sell-1" {
-		t.Errorf("order ids: want buy-1/sell-1, got %s/%s", filled.BuyOrderId, filled.SellOrderId)
+	if filled.GetBuyOrderId() != "buy-1" || filled.GetSellOrderId() != "sell-1" {
+		t.Errorf("order ids: want buy-1/sell-1, got %s/%s", filled.GetBuyOrderId(), filled.GetSellOrderId())
 	}
-	if filled.BuyerUserId != "user-b" || filled.SellerUserId != "user-s" {
-		t.Errorf("user ids: want user-b/user-s, got %s/%s", filled.BuyerUserId, filled.SellerUserId)
+	if filled.GetQuantity() != 100 {
+		t.Errorf("quantity: want 100, got %d", filled.GetQuantity())
 	}
-	if filled.Quantity != 100 {
-		t.Errorf("quantity: want 100, got %d", filled.Quantity)
-	}
-	if filled.Price.AmountCents != 15000 {
-		t.Errorf("price: want 15000, got %d", filled.Price.AmountCents)
+	if filled.GetPrice().GetAmountCents() != 15000 {
+		t.Errorf("price: want 15000, got %d", filled.GetPrice().GetAmountCents())
 	}
 }
 
-// TestHandleEventNoMatchPublishesNothing verifies that an order which does
-// not cross the spread simply rests, with no event published, since nothing
-// has happened yet that needs settling.
-func TestHandleEventNoMatchPublishesNothing(t *testing.T) {
-	pub := &stubPublisher{}
-	m := consumer.NewMatcher(pub)
+// TestPrepareNoMatchReturnsNothingToPublish verifies that an order which
+// does not cross the spread produces no events, since nothing has
+// happened yet that needs publishing.
+func TestPrepareNoMatchReturnsNothingToPublish(t *testing.T) {
+	m := consumer.NewMatcher()
 
-	m.HandleEvent(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15100))
-	if err := m.HandleEvent(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000)); err != nil {
+	_, commitSell, _, _ := m.Prepare(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15100))
+	commitSell()
+
+	toPublish, commitBuy, _, err := m.Prepare(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000))
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	commitBuy()
 
-	if len(pub.published) != 0 {
-		t.Errorf("want no published events, got %d", len(pub.published))
+	if len(toPublish) != 0 {
+		t.Errorf("want no events to publish, got %d", len(toPublish))
 	}
 }
 
-// TestHandleEventMultipleFillsPublishesOneEventEach verifies that one large
-// order sweeping several resting orders produces a separate Filled event per
+// TestDiscardLeavesBookUnchangedForRetry verifies the exact scenario this
+// whole redesign exists for: Prepare matches an order, discard is called
+// instead of commit, exactly as TransactionalGroupHandler would on a
+// failed publish, and an identical retry of the same order matches
+// identically, not against an already-consumed book.
+func TestDiscardLeavesBookUnchangedForRetry(t *testing.T) {
+	m := consumer.NewMatcher()
+
+	_, commitSell, _, _ := m.Prepare(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15000))
+	commitSell()
+
+	firstAttempt, _, discardBuy, err := m.Prepare(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 40, 15000))
+	if err != nil {
+		t.Fatalf("first attempt: unexpected error: %v", err)
+	}
+	if len(firstAttempt) != 1 {
+		t.Fatalf("want 1 fill on first attempt, got %d", len(firstAttempt))
+	}
+	discardBuy()
+
+	retry, commitRetry, _, err := m.Prepare(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 40, 15000))
+	if err != nil {
+		t.Fatalf("retry: unexpected error: %v", err)
+	}
+	commitRetry()
+
+	if len(retry) != 1 {
+		t.Fatalf("want 1 fill on retry, got %d", len(retry))
+	}
+	if retry[0].GetFilled().GetQuantity() != 40 {
+		t.Errorf("retry quantity: want 40, got %d", retry[0].GetFilled().GetQuantity())
+	}
+	if retry[0].GetFilled().GetSellerUserId() != "user-s" {
+		t.Errorf("retry should match against the same, restored seller, got %s", retry[0].GetFilled().GetSellerUserId())
+	}
+}
+
+// TestPrepareMultipleFillsOneEventEach verifies that one large order
+// sweeping several resting counterparties produces a separate event per
 // counterparty matched, each with its own trade_id.
-func TestHandleEventMultipleFillsPublishesOneEventEach(t *testing.T) {
-	pub := &stubPublisher{}
-	m := consumer.NewMatcher(pub)
+func TestPrepareMultipleFillsOneEventEach(t *testing.T) {
+	m := consumer.NewMatcher()
 
-	m.HandleEvent(context.Background(), orderSubmitted("sell-1", "user-s1", pb.OrderSide_SELL, 40, 15000))
-	m.HandleEvent(context.Background(), orderSubmitted("sell-2", "user-s2", pb.OrderSide_SELL, 30, 15000))
-	m.HandleEvent(context.Background(), orderSubmitted("sell-3", "user-s3", pb.OrderSide_SELL, 30, 15000))
-
-	if err := m.HandleEvent(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for i, id := range []string{"sell-1", "sell-2", "sell-3"} {
+		_, commit, _, _ := m.Prepare(context.Background(), orderSubmitted(id, id+"-user", pb.OrderSide_SELL, 30+int64(i*10), 15000))
+		commit()
 	}
 
-	if len(pub.published) != 3 {
-		t.Fatalf("want 3 published fills, got %d", len(pub.published))
+	toPublish, commit, _, err := m.Prepare(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	commit()
+
+	if len(toPublish) != 3 {
+		t.Fatalf("want 3 events to publish, got %d", len(toPublish))
 	}
 
 	seen := make(map[string]bool)
 	var totalQty int64
-	for _, event := range pub.published {
+	for _, event := range toPublish {
 		filled := event.GetFilled()
 		if filled == nil {
-			t.Fatal("want every published event to be a Filled event")
+			t.Fatal("want every event to be a Filled event")
 		}
-		if seen[filled.TradeId] {
-			t.Errorf("trade_id %s published more than once", filled.TradeId)
+		if seen[filled.GetTradeId()] {
+			t.Errorf("trade_id %s published more than once", filled.GetTradeId())
 		}
-		seen[filled.TradeId] = true
-		totalQty += filled.Quantity
+		seen[filled.GetTradeId()] = true
+		totalQty += filled.GetQuantity()
 	}
 	if totalQty != 100 {
-		t.Errorf("total filled quantity: want 100, got %d", totalQty)
+		t.Errorf("total matched quantity: want 100, got %d", totalQty)
 	}
 }
 
-// TestHandleEventIgnoresNonOrderSubmittedPayloads verifies that events other
-// than OrderSubmitted pass through without touching the order book, since
-// this matcher is only responsible for matching new orders.
-func TestHandleEventIgnoresNonOrderSubmittedPayloads(t *testing.T) {
-	pub := &stubPublisher{}
-	m := consumer.NewMatcher(pub)
+// TestPrepareIgnoresNonOrderSubmittedPayloads verifies that events other
+// than OrderSubmitted return nothing to publish and no-op commit and
+// discard functions, safe to call either one.
+func TestPrepareIgnoresNonOrderSubmittedPayloads(t *testing.T) {
+	m := consumer.NewMatcher()
 
-	if err := m.HandleEvent(context.Background(), filledEvent("trade-1", "buy-1", "sell-1", "user-b", "user-s", 100, 15000)); err != nil {
+	toPublish, commit, discard, err := m.Prepare(context.Background(), filledEvent("trade-1", "buy-1", "sell-1", "user-b", "user-s", 100, 15000))
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(pub.published) != 0 {
-		t.Errorf("expected no publishes for a non-OrderSubmitted event, got %d", len(pub.published))
+	if len(toPublish) != 0 {
+		t.Errorf("want no events to publish, got %d", len(toPublish))
 	}
-}
-
-// TestHandleEventPropagatesPublishError verifies that a publish failure is
-// surfaced to the caller rather than silently dropped, since the caller
-// needs this signal to decide whether the Kafka offset is safe to commit.
-func TestHandleEventPropagatesPublishError(t *testing.T) {
-	pub := &stubPublisher{}
-	m := consumer.NewMatcher(pub)
-	m.HandleEvent(context.Background(), orderSubmitted("sell-1", "user-s", pb.OrderSide_SELL, 100, 15000))
-
-	publishErr := errors.New("broker unavailable")
-	pub.err = publishErr
-
-	err := m.HandleEvent(context.Background(), orderSubmitted("buy-1", "user-b", pb.OrderSide_BUY, 100, 15000))
-	if !errors.Is(err, publishErr) {
-		t.Errorf("want wrapped publishErr, got %v", err)
-	}
+	commit()
+	discard()
 }

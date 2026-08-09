@@ -1,6 +1,7 @@
 package consumer
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/IBM/sarama"
@@ -9,6 +10,21 @@ import (
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 )
+
+// TransactionalEventHandler processes one event without finalizing
+// anything. It returns whatever should be published if this attempt is
+// ultimately kept, and two functions, commit and discard, exactly one of
+// which must be called once the caller knows whether the surrounding
+// Kafka transaction actually succeeded. Calling neither leaves whatever
+// Prepare mutated internally permanently, silently unresolved.
+type TransactionalEventHandler interface {
+	Prepare(ctx context.Context, event *pb.Event) (toPublish []*pb.Event, commit func(), discard func(), err error)
+}
+
+// Publisher sends a serialized event to a Kafka topic.
+type Publisher interface {
+	Publish(ctx context.Context, event *pb.Event) error
+}
 
 // TransactionalPublisher extends Publisher with the transaction control
 // methods sarama's transactional producer exposes. Matcher only ever
@@ -29,13 +45,13 @@ type TransactionalPublisher interface {
 // whatever gets produced, via AddMessageToTxn and CommitTxn, so consume,
 // match, produce, and offset commit succeed or fail as one atomic unit.
 type TransactionalGroupHandler struct {
-	handler EventHandler
+	handler TransactionalEventHandler
 	pub     TransactionalPublisher
 	dlq     DeadLetterPublisher
 	groupID string
 }
 
-func NewTransactionalGroupHandler(handler EventHandler, pub TransactionalPublisher, dlq DeadLetterPublisher, groupID string) *TransactionalGroupHandler {
+func NewTransactionalGroupHandler(handler TransactionalEventHandler, pub TransactionalPublisher, dlq DeadLetterPublisher, groupID string) *TransactionalGroupHandler {
 	return &TransactionalGroupHandler{handler: handler, pub: pub, dlq: dlq, groupID: groupID}
 }
 
@@ -52,9 +68,6 @@ func (h *TransactionalGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSes
 
 			var event pb.Event
 			if err := proto.Unmarshal(message.Value, &event); err != nil {
-				// Nothing was, or ever will be, produced for a message
-				// that never decoded, so there is no transaction to open.
-				// A direct commit is enough, same as GroupHandler.
 				log.Error().Err(err).
 					Str("topic", message.Topic).
 					Int64("offset", message.Offset).
@@ -78,23 +91,43 @@ func (h *TransactionalGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSes
 }
 
 func (h *TransactionalGroupHandler) processInTransaction(session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage, event *pb.Event) error {
+	toPublish, commit, discard, err := h.handler.Prepare(session.Context(), event)
+	if err != nil {
+		return fmt.Errorf("prepare event: %w", err)
+	}
+
 	if err := h.pub.BeginTxn(); err != nil {
+		discard()
 		return fmt.Errorf("begin txn: %w", err)
 	}
 
-	if err := h.handler.HandleEvent(session.Context(), event); err != nil {
-		if abortErr := h.pub.AbortTxn(); abortErr != nil {
-			log.Error().Err(abortErr).Msg("failed to abort transaction")
+	for _, event := range toPublish {
+		if err := h.pub.Publish(session.Context(), event); err != nil {
+			discard()
+			if abortErr := h.pub.AbortTxn(); abortErr != nil {
+				log.Error().Err(abortErr).Msg("failed to abort transaction")
+			}
+			return fmt.Errorf("publish: %w", err)
 		}
-		return fmt.Errorf("handle event: %w", err)
 	}
 
 	if err := h.pub.AddMessageToTxn(message, h.groupID, nil); err != nil {
+		discard()
 		if abortErr := h.pub.AbortTxn(); abortErr != nil {
 			log.Error().Err(abortErr).Msg("failed to abort transaction")
 		}
 		return fmt.Errorf("add message to txn: %w", err)
 	}
 
-	return h.pub.CommitTxn()
+	if err := h.pub.CommitTxn(); err != nil {
+		// CommitTxn itself failed, and the book is updated to reverse
+		// anything that took place in the transaction.
+		discard()
+		return fmt.Errorf("commit txn: %w", err)
+	}
+
+	// Only now, with the Kafka transaction genuinely committed, is it
+	// safe to make the incoming order's match real in memory.
+	commit()
+	return nil
 }

@@ -36,8 +36,8 @@ func main() {
 	}
 	defer dlqPub.Close()
 
-	matcher := consumer.NewMatcher(pub)
-	handler := consumer.NewGroupHandler(matcher, dlqPub)
+	matcher := consumer.NewMatcher()
+	handler := consumer.NewTransactionalGroupHandler(matcher, pub, dlqPub, groupID)
 
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V3_6_0_0

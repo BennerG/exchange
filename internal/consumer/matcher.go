@@ -2,52 +2,46 @@ package consumer
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 	"github.com/BennerG/exchange/internal/orderbook"
-	"github.com/google/uuid"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Publisher sends a serialized event to the fills topic.
-type Publisher interface {
-	Publish(ctx context.Context, event *pb.Event) error
-}
-
-// Matcher holds one stock's live order book and publishes a Filled event
-// for every match produced when a new order is added.
+// Matcher holds one stock's live order book. It never publishes anything
+// and never finalizes a match itself, both are deliberately left to
+// whatever calls Prepare, so a match can be reversed if the caller
+// later finds it cannot actually be published and committed.
 type Matcher struct {
 	book *orderbook.Book
-	pub  Publisher
 }
 
-func NewMatcher(pub Publisher) *Matcher {
-	return &Matcher{
-		book: orderbook.New(),
-		pub:  pub,
-	}
+func NewMatcher() *Matcher {
+	return &Matcher{book: orderbook.New()}
 }
 
-func (m *Matcher) HandleEvent(ctx context.Context, event *pb.Event) error {
+func (m *Matcher) Prepare(_ context.Context, event *pb.Event) ([]*pb.Event, func(), func(), error) {
 	orderSubmitted := event.GetOrderSubmitted()
 	if orderSubmitted == nil {
-		return nil
+		return nil, func() {}, func() {}, nil
 	}
 
 	order := &orderbook.Order{
-		ID:          orderSubmitted.OrderId,
-		UserID:      orderSubmitted.UserId,
-		Side:        toOrderbookSide(orderSubmitted.Side),
-		Quantity:    orderSubmitted.Quantity,
-		PriceCents:  orderSubmitted.PricePerShare.AmountCents,
-		SubmittedAt: orderSubmitted.SubmittedAt.AsTime(),
+		ID:          orderSubmitted.GetOrderId(),
+		UserID:      orderSubmitted.GetUserId(),
+		Side:        toOrderbookSide(orderSubmitted.GetSide()),
+		Quantity:    orderSubmitted.GetQuantity(),
+		PriceCents:  orderSubmitted.GetPricePerShare().GetAmountCents(),
+		SubmittedAt: orderSubmitted.GetSubmittedAt().AsTime(),
 	}
 
-	fills := m.book.Add(order)
+	outcome := m.book.Match(order)
 
-	for _, fill := range fills {
-		fillEvent := &pb.Event{
+	toPublish := make([]*pb.Event, 0, len(outcome.Fills))
+	for _, fill := range outcome.Fills {
+		toPublish = append(toPublish, &pb.Event{
 			Payload: &pb.Event_Filled{
 				Filled: &pb.Filled{
 					TradeId:      uuid.New().String(),
@@ -63,14 +57,13 @@ func (m *Matcher) HandleEvent(ctx context.Context, event *pb.Event) error {
 					FilledAt: timestamppb.Now(),
 				},
 			},
-		}
-
-		if err := m.pub.Publish(ctx, fillEvent); err != nil {
-			return fmt.Errorf("publish fill: %w", err)
-		}
+		})
 	}
 
-	return nil
+	commit := func() { m.book.Apply(outcome) }
+	discard := func() { m.book.Discard(outcome) }
+
+	return toPublish, commit, discard, nil
 }
 
 func toOrderbookSide(side pb.OrderSide) orderbook.Side {

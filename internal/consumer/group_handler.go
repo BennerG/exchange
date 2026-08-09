@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog/log"
@@ -81,24 +80,4 @@ func (h *GroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 			return nil
 		}
 	}
-}
-
-func (h *GroupHandler) deadLetter(session sarama.ConsumerGroupSession, message *sarama.ConsumerMessage, reason string) {
-	entry := DeadLetterEntry{
-		SourceTopic: message.Topic,
-		Partition:   message.Partition,
-		Offset:      message.Offset,
-		Reason:      reason,
-		Payload:     message.Value,
-		FailedAt:    time.Now(),
-	}
-	if err := h.dlq.PublishDeadLetter(session.Context(), entry); err != nil {
-		// The DLQ publish itself failed. Leaving the offset uncommitted
-		// means this message redelivers from the top, including a fresh
-		// attempt at the DLQ, rather than being silently lost entirely.
-		log.Error().Err(err).Msg("failed to publish to dead letter queue, leaving offset uncommitted")
-		return
-	}
-	session.MarkMessage(message, "")
-	session.Commit()
 }

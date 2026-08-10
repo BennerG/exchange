@@ -1,0 +1,80 @@
+{
+  "title": "Exchange",
+  "uid": "exchange",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Order Submit Latency (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(exchange_producer_order_submit_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum(rate(exchange_producer_order_submit_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99", "refId": "B" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Orders by Outcome",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(exchange_producer_orders_total[5m])) by (outcome)", "legendFormat": "{{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Fill Rate",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(exchange_matcher_fills_total[5m])", "legendFormat": "fills/sec", "refId": "A" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Matcher Transaction Outcomes",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(exchange_matcher_transactions_total[5m])) by (outcome)", "legendFormat": "{{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "exchange_consumer_lag", "legendFormat": "{{topic}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Settlement Outcomes",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(exchange_settler_settlements_total[5m])) by (outcome)", "legendFormat": "{{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Dead Letter Rate",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(exchange_dlq_messages_total[5m])) by (topic)", "legendFormat": "{{topic}}", "refId": "A" }
+      ]
+    }
+  ]
+}

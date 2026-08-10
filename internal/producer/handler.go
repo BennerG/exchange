@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 
-	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
 )
 
 // Publisher sends a serialized event to the orders topic.
@@ -38,19 +40,25 @@ func NewHandler(pub Publisher) http.Handler {
 }
 
 func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
+	timer := prometheus.NewTimer(orderLatency)
+	defer timer.ObserveDuration()
+
 	var req orderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		ordersTotal.WithLabelValues("rejected").Inc()
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
 	if err := validateOrder(req); err != nil {
+		ordersTotal.WithLabelValues("rejected").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	side, err := parseSide(req.Side)
 	if err != nil {
+		ordersTotal.WithLabelValues("rejected").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -73,10 +81,12 @@ func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.pub.Publish(r.Context(), event); err != nil {
+		ordersTotal.WithLabelValues("error").Inc()
 		http.Error(w, "failed to publish order", http.StatusInternalServerError)
 		return
 	}
 
+	ordersTotal.WithLabelValues("accepted").Inc()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"order_id": orderID})

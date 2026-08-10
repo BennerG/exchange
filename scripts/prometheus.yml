@@ -6,6 +6,10 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:2112"]
 
-  - job_name: "exchange-consumer"
+  - job_name: "exchange-matcher"
     static_configs:
       - targets: ["host.docker.internal:2113"]
+
+  - job_name: "exchange-settler"
+    static_configs:
+      - targets: ["host.docker.internal:2114"]

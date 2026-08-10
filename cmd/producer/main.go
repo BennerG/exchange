@@ -10,13 +10,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BennerG/exchange/internal/producer"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/BennerG/exchange/internal/metrics"
+	"github.com/BennerG/exchange/internal/producer"
 )
 
 func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+	go func() {
+		addr := envOr("METRICS_ADDR", ":2112")
+		if err := metrics.Serve(addr); err != nil {
+			log.Error().Err(err).Msg("metrics server error")
+		}
+	}()
 
 	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	addr := envOr("ADDR", ":8080")

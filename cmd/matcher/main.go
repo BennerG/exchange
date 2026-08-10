@@ -13,11 +13,18 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/BennerG/exchange/internal/consumer"
+	"github.com/BennerG/exchange/internal/metrics"
 	"github.com/BennerG/exchange/internal/store"
 )
 
 func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+	go func() {
+		addr := envOr("METRICS_ADDR", ":2113")
+		if err := metrics.Serve(addr); err != nil {
+			log.Error().Err(err).Msg("metrics server error")
+		}
+	}()
 
 	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	groupID := envOr("GROUP_ID", "exchange-matcher")

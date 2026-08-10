@@ -89,6 +89,7 @@ func deadLetterAndCommit(dlq DeadLetterPublisher, session sarama.ConsumerGroupSe
 		log.Error().Err(err).Msg("failed to publish to dead letter queue, leaving offset uncommitted")
 		return
 	}
+	dlqMessagesTotal.WithLabelValues(message.Topic).Inc()
 	session.MarkMessage(message, "")
 	session.Commit()
 }

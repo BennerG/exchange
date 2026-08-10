@@ -44,6 +44,12 @@ func (h *GroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 				return nil
 			}
 
+			lag := claim.HighWaterMarkOffset() - message.Offset - 1
+			if lag < 0 {
+				lag = 0
+			}
+			consumerLag.WithLabelValues(message.Topic).Set(float64(lag))
+
 			var event pb.Event
 			if err := proto.Unmarshal(message.Value, &event); err != nil {
 				log.Error().Err(err).

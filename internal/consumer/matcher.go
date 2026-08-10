@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/BennerG/exchange/internal/gen/proto/trading/events"
@@ -60,7 +61,13 @@ func (m *Matcher) Prepare(ctx context.Context, event *pb.Event) ([]*pb.Event, fu
 		SubmittedAt: orderSubmitted.GetSubmittedAt().AsTime(),
 	}
 
+	timer := prometheus.NewTimer(matchDuration)
 	outcome := m.book.Match(order)
+	timer.ObserveDuration()
+
+	if len(outcome.Fills) > 0 {
+		fillsTotal.Add(float64(len(outcome.Fills)))
+	}
 
 	toPublish := make([]*pb.Event, 0, len(outcome.Fills))
 	for _, fill := range outcome.Fills {

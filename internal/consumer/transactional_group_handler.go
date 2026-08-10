@@ -66,6 +66,12 @@ func (h *TransactionalGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSes
 				return nil
 			}
 
+			lag := claim.HighWaterMarkOffset() - message.Offset - 1
+			if lag < 0 {
+				lag = 0
+			}
+			consumerLag.WithLabelValues(message.Topic).Set(float64(lag))
+
 			var event pb.Event
 			if err := proto.Unmarshal(message.Value, &event); err != nil {
 				log.Error().Err(err).
@@ -98,15 +104,17 @@ func (h *TransactionalGroupHandler) processInTransaction(session sarama.Consumer
 
 	if err := h.pub.BeginTxn(); err != nil {
 		discard()
+		transactionsTotal.WithLabelValues("begin_failed").Inc()
 		return fmt.Errorf("begin txn: %w", err)
 	}
 
-	for _, event := range toPublish {
-		if err := h.pub.Publish(session.Context(), event); err != nil {
+	for _, e := range toPublish {
+		if err := h.pub.Publish(session.Context(), e); err != nil {
 			discard()
 			if abortErr := h.pub.AbortTxn(); abortErr != nil {
 				log.Error().Err(abortErr).Msg("failed to abort transaction")
 			}
+			transactionsTotal.WithLabelValues("aborted").Inc()
 			return fmt.Errorf("publish: %w", err)
 		}
 	}
@@ -116,13 +124,17 @@ func (h *TransactionalGroupHandler) processInTransaction(session sarama.Consumer
 		if abortErr := h.pub.AbortTxn(); abortErr != nil {
 			log.Error().Err(abortErr).Msg("failed to abort transaction")
 		}
+		transactionsTotal.WithLabelValues("aborted").Inc()
 		return fmt.Errorf("add message to txn: %w", err)
 	}
 
 	if err := h.pub.CommitTxn(); err != nil {
 		discard()
+		transactionsTotal.WithLabelValues("commit_failed").Inc()
 		return fmt.Errorf("commit txn: %w", err)
 	}
+
+	transactionsTotal.WithLabelValues("committed").Inc()
 
 	if err := commit(); err != nil {
 		log.Error().Err(err).

@@ -6,12 +6,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/BennerG/exchange/internal/consumer"
+	"github.com/BennerG/exchange/internal/store"
 )
 
 func main() {
@@ -36,7 +38,20 @@ func main() {
 	}
 	defer dlqPub.Close()
 
-	matcher := consumer.NewMatcher()
+	connString := envOr("DATABASE_URL", "postgresql://exchange:exchange@localhost:5432/exchange?sslmode=disable")
+
+	pendingStore, err := store.NewPostgresStore(ctx, connString)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create postgres store")
+	}
+	defer pendingStore.Close()
+
+	retryingStore := store.NewRetryingPendingOrderStore(pendingStore, 3, 200*time.Millisecond)
+
+	matcher, err := consumer.NewMatcher(ctx, retryingStore)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to reconstruct matcher from pending orders")
+	}
 	handler := consumer.NewTransactionalGroupHandler(matcher, pub, dlqPub, groupID)
 
 	cfg := sarama.NewConfig()

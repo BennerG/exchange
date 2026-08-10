@@ -359,3 +359,31 @@ func TestApplyRestsIncomingOrderWithRemainder(t *testing.T) {
 		t.Error("expected buy-1 to be resting and cancellable after Apply")
 	}
 }
+
+// TestRestoreDoesNotMatch verifies that two orders which would cross if
+// added normally rest side by side untouched when restored instead,
+// proving Restore genuinely bypasses matching rather than approximating it.
+func TestRestoreDoesNotMatch(t *testing.T) {
+	b := orderbook.New()
+	b.Restore(order("sell-1", "user-s", orderbook.Sell, 100, 15000, 0))
+	b.Restore(order("buy-1", "user-b", orderbook.Buy, 100, 15500, 1))
+
+	if !b.Cancel("sell-1") {
+		t.Error("expected sell-1 to be resting after Restore")
+	}
+	if !b.Cancel("buy-1") {
+		t.Error("expected buy-1 to be resting after Restore")
+	}
+}
+
+// TestRestoredOrderMatchesNormally verifies a restored order behaves
+// identically to a freshly added one for any future match.
+func TestRestoredOrderMatchesNormally(t *testing.T) {
+	b := orderbook.New()
+	b.Restore(order("sell-1", "user-s", orderbook.Sell, 100, 15000, 0))
+
+	fills := b.Add(order("buy-1", "user-b", orderbook.Buy, 100, 15000, 1))
+	if len(fills) != 1 {
+		t.Fatalf("want 1 fill against the restored order, got %d", len(fills))
+	}
+}

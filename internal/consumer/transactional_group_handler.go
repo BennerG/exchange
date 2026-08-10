@@ -18,7 +18,7 @@ import (
 // Kafka transaction actually succeeded. Calling neither leaves whatever
 // Prepare mutated internally permanently, silently unresolved.
 type TransactionalEventHandler interface {
-	Prepare(ctx context.Context, event *pb.Event) (toPublish []*pb.Event, commit func(), discard func(), err error)
+	Prepare(ctx context.Context, event *pb.Event) (toPublish []*pb.Event, commit func() error, discard func(), err error)
 }
 
 // Publisher sends a serialized event to a Kafka topic.
@@ -120,14 +120,15 @@ func (h *TransactionalGroupHandler) processInTransaction(session sarama.Consumer
 	}
 
 	if err := h.pub.CommitTxn(); err != nil {
-		// CommitTxn itself failed, and the book is updated to reverse
-		// anything that took place in the transaction.
 		discard()
 		return fmt.Errorf("commit txn: %w", err)
 	}
 
-	// Only now, with the Kafka transaction genuinely committed, is it
-	// safe to make the incoming order's match real in memory.
-	commit()
+	if err := commit(); err != nil {
+		log.Error().Err(err).
+			Str("topic", message.Topic).
+			Int64("offset", message.Offset).
+			Msg("kafka transaction committed but pending order persistence failed, book state may drift until this order is next touched")
+	}
 	return nil
 }

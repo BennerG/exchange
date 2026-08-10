@@ -244,6 +244,21 @@ func (b *Book) Cancel(orderID string) bool {
 	return true
 }
 
+// Restore places an order directly onto its resting side, with no
+// matching attempted. It exists only for reconstructing book state from
+// persisted pending orders at startup, where every order restored is
+// already known, by construction, not to cross anything else being
+// restored alongside it.
+func (b *Book) Restore(o *Order) {
+	switch o.Side {
+	case Buy:
+		heap.Push(b.bids, o)
+	case Sell:
+		heap.Push(b.asks, o)
+	}
+	b.resting[o.ID] = o
+}
+
 func (b *Book) matchBuy(buy *Order) ([]FillResult, []*Order) {
 	var fills []FillResult
 	var popped []*Order

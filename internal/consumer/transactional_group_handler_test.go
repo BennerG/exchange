@@ -17,16 +17,17 @@ import (
 type fakeTransactionalEventHandler struct {
 	toPublish []*pb.Event
 	err       error
+	commitErr error
 
 	committed bool
 	discarded bool
 }
 
-func (f *fakeTransactionalEventHandler) Prepare(_ context.Context, _ *pb.Event) ([]*pb.Event, func(), func(), error) {
+func (f *fakeTransactionalEventHandler) Prepare(_ context.Context, _ *pb.Event) ([]*pb.Event, func() error, func(), error) {
 	if f.err != nil {
 		return nil, nil, nil, f.err
 	}
-	commit := func() { f.committed = true }
+	commit := func() error { f.committed = true; return f.commitErr }
 	discard := func() { f.discarded = true }
 	return f.toPublish, commit, discard, nil
 }
@@ -209,5 +210,30 @@ func TestTransactionalConsumeClaimUnmarshalFailureNeverCallsPrepare(t *testing.T
 	}
 	if len(dlq.entries) != 1 {
 		t.Fatalf("want 1 dead letter entry, got %d", len(dlq.entries))
+	}
+}
+
+// TestTransactionalConsumeClaimCommitFailureAfterCommitTxnDoesNotReturnError
+// verifies the exact scenario this design exists for: CommitTxn succeeds,
+// the persistence call inside commit then fails, and ConsumeClaim still
+// returns nil, since Kafka has already committed and there is nothing
+// left to retry.
+func TestTransactionalConsumeClaimCommitFailureAfterCommitTxnDoesNotReturnError(t *testing.T) {
+	handler := &fakeTransactionalEventHandler{
+		toPublish: []*pb.Event{fillPayload()},
+		commitErr: errors.New("pending order write failed"),
+	}
+	pub := &fakeTransactionalPublisher{}
+	dlq := &fakeDeadLetterPublisher{}
+	gh := consumer.NewTransactionalGroupHandler(handler, pub, dlq, "exchange-matcher")
+
+	session := &fakeSession{ctx: context.Background()}
+	claim := newClaimWithMessages(&sarama.ConsumerMessage{Topic: "orders", Offset: 5, Value: validEventBytes(t)})
+
+	if err := gh.ConsumeClaim(session, claim); err != nil {
+		t.Fatalf("want no error even though commit's persistence failed, got %v", err)
+	}
+	if pub.committed != 1 || pub.aborted != 0 {
+		t.Errorf("want the kafka transaction to have committed successfully regardless, got committed=%d aborted=%d", pub.committed, pub.aborted)
 	}
 }

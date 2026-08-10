@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -13,8 +14,9 @@ import (
 )
 
 type Matcher struct {
-	book    *orderbook.Book
-	pending store.PendingOrderStore
+	book     *orderbook.Book
+	pending  store.PendingOrderStore
+	snapshot atomic.Pointer[[]store.PendingOrder]
 }
 
 // NewMatcher reconstructs the order book from persisted pending orders
@@ -38,8 +40,9 @@ func NewMatcher(ctx context.Context, pending store.PendingOrderStore) (*Matcher,
 			SubmittedAt: row.CreatedAt,
 		})
 	}
-
-	return &Matcher{book: book, pending: pending}, nil
+	m := &Matcher{book: book, pending: pending}
+	m.refreshSnapshot()
+	return m, nil
 }
 
 func (m *Matcher) Prepare(ctx context.Context, event *pb.Event) ([]*pb.Event, func() error, func(), error) {
@@ -79,11 +82,43 @@ func (m *Matcher) Prepare(ctx context.Context, event *pb.Event) ([]*pb.Event, fu
 
 	commit := func() error {
 		m.book.Apply(outcome)
-		return m.persistMatch(ctx, order, outcome)
+		err := m.persistMatch(ctx, order, outcome)
+		m.refreshSnapshot()
+		return err
 	}
-	discard := func() { m.book.Discard(outcome) }
+	discard := func() {
+		m.book.Discard(outcome)
+		m.refreshSnapshot()
+	}
 
 	return toPublish, commit, discard, nil
+}
+
+// Snapshot returns the most recently published view of every currently
+// resting order. Safe to call from any goroutine.
+func (m *Matcher) Snapshot() []store.PendingOrder {
+	p := m.snapshot.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func (m *Matcher) refreshSnapshot() {
+	resting := m.book.Snapshot()
+	out := make([]store.PendingOrder, 0, len(resting))
+	for _, o := range resting {
+		out = append(out, store.PendingOrder{
+			OrderID:           o.ID,
+			UserID:            o.UserID,
+			Side:              sideToString(o.Side),
+			QuantityRequested: o.Quantity,
+			QuantityFilled:    o.Filled,
+			PriceCents:        o.PriceCents,
+			CreatedAt:         o.SubmittedAt,
+		})
+	}
+	m.snapshot.Store(&out)
 }
 
 func (m *Matcher) persistMatch(ctx context.Context, incoming *orderbook.Order, outcome *orderbook.MatchOutcome) error {
@@ -105,9 +140,9 @@ func (m *Matcher) persistMatch(ctx context.Context, incoming *orderbook.Order, o
 		}
 	}
 
-	var insert *store.PendingOrder
+	var inserts []store.PendingOrder
 	if incoming.Remaining() > 0 {
-		insert = &store.PendingOrder{
+		inserts = []store.PendingOrder{{
 			OrderID:           incoming.ID,
 			UserID:            incoming.UserID,
 			Side:              sideToString(incoming.Side),
@@ -115,13 +150,13 @@ func (m *Matcher) persistMatch(ctx context.Context, incoming *orderbook.Order, o
 			QuantityFilled:    incoming.Filled,
 			PriceCents:        incoming.PriceCents,
 			CreatedAt:         incoming.SubmittedAt,
-		}
+		}}
 	}
 
-	if len(updates) == 0 && len(deletes) == 0 && insert == nil {
+	if len(updates) == 0 && len(deletes) == 0 && inserts == nil {
 		return nil
 	}
-	return m.pending.CommitMatch(ctx, updates, deletes, insert)
+	return m.pending.CommitMatch(ctx, updates, deletes, inserts)
 }
 
 func toOrderbookSide(side pb.OrderSide) orderbook.Side {

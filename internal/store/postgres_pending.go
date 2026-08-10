@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-func (p *PostgresStore) CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, insert *PendingOrder) error {
+func (p *PostgresStore) CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, inserts []PendingOrder) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -28,7 +28,7 @@ func (p *PostgresStore) CommitMatch(ctx context.Context, updates []PendingUpdate
 		}
 	}
 
-	if insert != nil {
+	for _, insert := range inserts {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO pending_orders (order_id, user_id, side, quantity_requested, quantity_filled, price_cents, created_at)
 			VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)

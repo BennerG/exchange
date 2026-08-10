@@ -21,6 +21,6 @@ type PendingUpdate struct {
 }
 
 type PendingOrderStore interface {
-	CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, insert *PendingOrder) error
+	CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, inserts []PendingOrder) error
 	LoadAll(ctx context.Context) ([]PendingOrder, error)
 }

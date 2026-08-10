@@ -259,6 +259,18 @@ func (b *Book) Restore(o *Order) {
 	b.resting[o.ID] = o
 }
 
+// Snapshot returns a value copy of every currently resting order. Like
+// every other Book method, this is only safe to call from the goroutine
+// that owns the Book. The returned copies are safe to hand to another
+// goroutine, since nothing else holds a reference to them.
+func (b *Book) Snapshot() []Order {
+	out := make([]Order, 0, len(b.resting))
+	for _, o := range b.resting {
+		out = append(out, *o)
+	}
+	return out
+}
+
 func (b *Book) matchBuy(buy *Order) ([]FillResult, []*Order) {
 	var fills []FillResult
 	var popped []*Order

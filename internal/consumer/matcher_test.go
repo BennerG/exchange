@@ -19,13 +19,13 @@ type fakePendingOrderStore struct {
 
 	lastUpdates []store.PendingUpdate
 	lastDeletes []string
-	lastInsert  *store.PendingOrder
+	lastInserts []store.PendingOrder
 	commitCalls int
 }
 
-func (f *fakePendingOrderStore) CommitMatch(_ context.Context, updates []store.PendingUpdate, deletes []string, insert *store.PendingOrder) error {
+func (f *fakePendingOrderStore) CommitMatch(_ context.Context, updates []store.PendingUpdate, deletes []string, inserts []store.PendingOrder) error {
 	f.commitCalls++
-	f.lastUpdates, f.lastDeletes, f.lastInsert = updates, deletes, insert
+	f.lastUpdates, f.lastDeletes, f.lastInserts = updates, deletes, inserts
 	return f.commitErr
 }
 
@@ -257,8 +257,8 @@ func TestPrepareCommitPersistsNewRestingOrder(t *testing.T) {
 	if pending.commitCalls != 1 {
 		t.Fatalf("want 1 CommitMatch call, got %d", pending.commitCalls)
 	}
-	if pending.lastInsert == nil || pending.lastInsert.OrderID != "buy-1" {
-		t.Errorf("want an insert for buy-1, got %+v", pending.lastInsert)
+	if len(pending.lastInserts) != 1 || pending.lastInserts[0].OrderID != "buy-1" {
+		t.Errorf("want an insert for buy-1, got %+v", pending.lastInserts)
 	}
 	if len(pending.lastUpdates) != 0 || len(pending.lastDeletes) != 0 {
 		t.Error("want no updates or deletes for a fresh resting order")

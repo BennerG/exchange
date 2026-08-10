@@ -23,12 +23,12 @@ func NewRetryingPendingOrderStore(inner PendingOrderStore, maxAttempts int, base
 	return &RetryingPendingOrderStore{inner: inner, maxAttempts: maxAttempts, baseBackoff: baseBackoff}
 }
 
-func (r *RetryingPendingOrderStore) CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, insert *PendingOrder) error {
+func (r *RetryingPendingOrderStore) CommitMatch(ctx context.Context, updates []PendingUpdate, deletes []string, inserts []PendingOrder) error {
 	backoff := r.baseBackoff
 	var lastErr error
 
 	for attempt := 1; attempt <= r.maxAttempts; attempt++ {
-		lastErr = r.inner.CommitMatch(ctx, updates, deletes, insert)
+		lastErr = r.inner.CommitMatch(ctx, updates, deletes, inserts)
 		if lastErr == nil {
 			return nil
 		}

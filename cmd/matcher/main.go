@@ -53,6 +53,8 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to reconstruct matcher from pending orders")
 	}
 	handler := consumer.NewTransactionalGroupHandler(matcher, pub, dlqPub, groupID)
+	reconciler := consumer.NewReconciler(matcher.Snapshot, retryingStore, 30*time.Second)
+	go reconciler.Run(ctx)
 
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V3_6_0_0

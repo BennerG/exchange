@@ -66,16 +66,7 @@ func main() {
 		}
 	}()
 
-	go func() {
-		for {
-			if err := group.Consume(ctx, []string{"fills"}, handler); err != nil {
-				log.Error().Err(err).Msg("consumer group session ended")
-			}
-			if ctx.Err() != nil {
-				return
-			}
-		}
-	}()
+	go consumer.RunGroup(ctx, group, []string{"fills"}, handler)
 
 	log.Info().Str("group_id", groupID).Msg("settler consuming")
 

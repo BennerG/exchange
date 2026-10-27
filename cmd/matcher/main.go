@@ -81,16 +81,7 @@ func main() {
 		}
 	}()
 
-	go func() {
-		for {
-			if err := group.Consume(ctx, []string{"orders"}, handler); err != nil {
-				log.Error().Err(err).Msg("consumer group session ended")
-			}
-			if ctx.Err() != nil {
-				return
-			}
-		}
-	}()
+	go consumer.RunGroup(ctx, group, []string{"orders"}, handler)
 
 	log.Info().Str("group_id", groupID).Msg("matcher consuming")
 

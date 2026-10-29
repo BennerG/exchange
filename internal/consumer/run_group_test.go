@@ -3,34 +3,20 @@ package consumer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/IBM/sarama"
 )
 
-type fakeClock struct{ t time.Time }
+// consumeFunc adapts a function to sessionRunner, like http.HandlerFunc.
+type consumeFunc func(context.Context, []string, sarama.ConsumerGroupHandler) error
 
-func (c *fakeClock) now() time.Time { return c.t }
-
-// scriptedRunner plays back session lengths on a fake clock and cancels the
-// context after the last one, so the loop under test terminates on its own.
-type scriptedRunner struct {
-	clock    *fakeClock
-	sessions []time.Duration
-	err      error
-	cancel   context.CancelFunc
-	calls    int
-}
-
-func (r *scriptedRunner) Consume(context.Context, []string, sarama.ConsumerGroupHandler) error {
-	r.clock.t = r.clock.t.Add(r.sessions[r.calls])
-	r.calls++
-	if r.calls == len(r.sessions) {
-		r.cancel()
-	}
-	return r.err
+func (f consumeFunc) Consume(ctx context.Context, topics []string, h sarama.ConsumerGroupHandler) error {
+	return f(ctx, topics, h)
 }
 
 func msList(n ...int) []time.Duration {
@@ -41,7 +27,9 @@ func msList(n ...int) []time.Duration {
 	return out
 }
 
-// Pure schedule logic, including both sides of the healthy-session boundary.
+// TestNextBackoff verifies the backoff schedule as plain arithmetic: doubling,
+// the cap, the reset after a healthy session, and both sides of the one second
+// boundary.
 func TestNextBackoff(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -70,8 +58,10 @@ func TestNextBackoff(t *testing.T) {
 	}
 }
 
-// Drives the real loop with a fake clock and a recording sleep, so the
-// waits it asks for are asserted without any real time passing.
+// TestRunGroupWaits verifies the pauses RunGroup actually takes between
+// sessions, measured on synctest's fake clock so no real time passes. The
+// final pause is cut short by the cancel that ends each scenario, so it is
+// not observed.
 func TestRunGroupWaits(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -79,71 +69,141 @@ func TestRunGroupWaits(t *testing.T) {
 		err       error
 		wantWaits []time.Duration
 	}{
-		{"short sessions double the wait", msList(10, 10, 10, 10), nil, msList(200, 400, 800, 1600)},
-		{"a healthy session resets the schedule and skips the sleep", []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 5 * time.Second, 10 * time.Millisecond}, nil, msList(200, 400, 200)},
-		{"waits are capped", msList(10, 10, 10, 10, 10, 10, 10, 10), nil, msList(200, 400, 800, 1600, 3200, 5000, 5000, 5000)},
-		{"a Consume error does not change the schedule", msList(10, 10), errors.New("boom"), msList(200, 400)},
+		{"short sessions double the wait", msList(10, 10, 10, 10), nil, msList(200, 400, 800)},
+		{"a healthy session resets the schedule and skips the pause", msList(10, 10, 5000, 10), nil, msList(200, 400, 0)},
+		{"waits are capped", msList(10, 10, 10, 10, 10, 10, 10, 10), nil, msList(200, 400, 800, 1600, 3200, 5000, 5000)},
+		{"a Consume error does not change the schedule", msList(10, 10, 10), errors.New("boom"), msList(200, 400)},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
 
-			clock := &fakeClock{t: time.Unix(0, 0)}
-			runner := &scriptedRunner{clock: clock, sessions: tt.sessions, err: tt.err, cancel: cancel}
+				var starts []time.Time
+				runner := consumeFunc(func(context.Context, []string, sarama.ConsumerGroupHandler) error {
+					starts = append(starts, time.Now())
+					time.Sleep(tt.sessions[len(starts)-1])
+					if len(starts) == len(tt.sessions) {
+						cancel()
+					}
+					return tt.err
+				})
 
-			var waits []time.Duration
-			sleep := func(ctx context.Context, d time.Duration) bool {
-				waits = append(waits, d)
-				return ctx.Err() == nil
-			}
+				RunGroup(ctx, runner, []string{"orders"}, nil)
 
-			runGroup(ctx, runner, []string{"orders"}, nil, clock.now, sleep)
-
-			if runner.calls != len(tt.sessions) {
-				t.Errorf("Consume called %d times, want %d", runner.calls, len(tt.sessions))
-			}
-			if !slices.Equal(waits, tt.wantWaits) {
-				t.Errorf("waits = %v, want %v", waits, tt.wantWaits)
-			}
+				if len(starts) != len(tt.sessions) {
+					t.Fatalf("Consume called %d times, want %d", len(starts), len(tt.sessions))
+				}
+				var waits []time.Duration
+				for i := 1; i < len(starts); i++ {
+					waits = append(waits, starts[i].Sub(starts[i-1])-tt.sessions[i-1])
+				}
+				if !slices.Equal(waits, tt.wantWaits) {
+					t.Errorf("waits = %v, want %v", waits, tt.wantWaits)
+				}
+			})
 		})
 	}
 }
 
-// A context cancelled before the first session must not start one.
+// TestRunGroupDoesNotConsumeWhenAlreadyCancelled verifies that a context
+// cancelled before the first session never starts one.
 func TestRunGroupDoesNotConsumeWhenAlreadyCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	runner := &scriptedRunner{clock: &fakeClock{t: time.Unix(0, 0)}, cancel: cancel}
-	runGroup(ctx, runner, []string{"orders"}, nil, time.Now, sleepCtx)
+	calls := 0
+	runner := consumeFunc(func(context.Context, []string, sarama.ConsumerGroupHandler) error {
+		calls++
+		return nil
+	})
+	RunGroup(ctx, runner, []string{"orders"}, nil)
 
-	if runner.calls != 0 {
-		t.Errorf("Consume called %d times, want 0", runner.calls)
+	if calls != 0 {
+		t.Errorf("Consume called %d times, want 0", calls)
 	}
 }
 
-// Shutdown must interrupt a long wait instead of blocking for it.
-func TestSleepCtx(t *testing.T) {
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-
+// TestRunGroupStopsWhenGroupClosed verifies that a closed group ends the loop
+// at once, wrapped or not, instead of retrying a group that can never recover.
+// The cancel after three calls only keeps a regression from looping forever.
+func TestRunGroupStopsWhenGroupClosed(t *testing.T) {
 	tests := []struct {
 		name string
-		ctx  context.Context
-		d    time.Duration
-		want bool
+		err  error
 	}{
-		{"completes when the context stays live", context.Background(), time.Millisecond, true},
-		{"returns false at once when cancelled", cancelled, time.Hour, false},
+		{"closed group", sarama.ErrClosedConsumerGroup},
+		{"wrapped closed group", fmt.Errorf("consume: %w", sarama.ErrClosedConsumerGroup)},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sleepCtx(tt.ctx, tt.d); got != tt.want {
-				t.Errorf("sleepCtx = %v, want %v", got, tt.want)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				calls := 0
+				begin := time.Now()
+				runner := consumeFunc(func(context.Context, []string, sarama.ConsumerGroupHandler) error {
+					calls++
+					if calls == 3 {
+						cancel()
+					}
+					return tt.err
+				})
+
+				RunGroup(ctx, runner, []string{"orders"}, nil)
+
+				if calls != 1 {
+					t.Errorf("Consume called %d times, want 1", calls)
+				}
+				if elapsed := time.Since(begin); elapsed != 0 {
+					t.Errorf("waited %v before returning, want 0", elapsed)
+				}
+			})
+		})
+	}
+}
+
+// TestSleepCtx verifies that sleepCtx waits the full duration when left alone
+// and returns the moment its context is cancelled. On the fake clock, a missed
+// cancel shows up as extra elapsed time instead of a hung test.
+func TestSleepCtx(t *testing.T) {
+	tests := []struct {
+		name        string
+		cancelAfter time.Duration
+		wantElapsed time.Duration
+	}{
+		{"runs to completion when never cancelled", -1, time.Hour},
+		{"cancel mid wait returns at the cancel", 10 * time.Minute, 10 * time.Minute},
+		{"cancel at the start returns at once", 0, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				start := time.Now()
+				done := make(chan struct{})
+				go func() {
+					sleepCtx(ctx, time.Hour)
+					close(done)
+				}()
+
+				if tt.cancelAfter >= 0 {
+					time.Sleep(tt.cancelAfter)
+					cancel()
+				}
+				<-done
+
+				if elapsed := time.Since(start); elapsed != tt.wantElapsed {
+					t.Errorf("elapsed = %v, want %v", elapsed, tt.wantElapsed)
+				}
+			})
 		})
 	}
 }

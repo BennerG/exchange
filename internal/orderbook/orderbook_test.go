@@ -1,6 +1,7 @@
 package orderbook_test
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -385,5 +386,59 @@ func TestRestoredOrderMatchesNormally(t *testing.T) {
 	fills := b.Add(order("buy-1", "user-b", orderbook.Buy, 100, 15000, 1))
 	if len(fills) != 1 {
 		t.Fatalf("want 1 fill against the restored order, got %d", len(fills))
+	}
+}
+
+// TestCancelKeepsIndexesConsistent verifies that cancelling orders from inside
+// a multi-order heap, including ones that moved during an earlier cancel, still
+// removes the right order on both sides of the book. It catches Swap failing to
+// keep each order's index current.
+func TestCancelKeepsIndexesConsistent(t *testing.T) {
+	cancels := []struct {
+		name     string
+		cancel   []string
+		wantFill []string
+	}{
+		{"cancel best", []string{"r1"}, []string{"r2", "r3", "r4", "r5"}},
+		{"cancel middle", []string{"r3"}, []string{"r1", "r2", "r4", "r5"}},
+		{"cancel last", []string{"r5"}, []string{"r1", "r2", "r3", "r4"}},
+		{"cancel an order that moved up", []string{"r3", "r5"}, []string{"r1", "r2", "r4"}},
+		{"cancel an order that sifted down", []string{"r1", "r5"}, []string{"r2", "r3", "r4"}},
+	}
+	sides := []struct {
+		name       string
+		resting    orderbook.Side
+		incoming   orderbook.Side
+		price      func(i int) int64
+		incomingPx int64
+		restingID  func(orderbook.FillResult) string
+	}{
+		{"asks", orderbook.Sell, orderbook.Buy, func(i int) int64 { return int64(15000 + i*100) }, 99999,
+			func(f orderbook.FillResult) string { return f.SellOrderID }},
+		{"bids", orderbook.Buy, orderbook.Sell, func(i int) int64 { return int64(15000 - i*100) }, 1,
+			func(f orderbook.FillResult) string { return f.BuyOrderID }},
+	}
+
+	for _, sd := range sides {
+		for _, tt := range cancels {
+			t.Run(sd.name+"/"+tt.name, func(t *testing.T) {
+				b := orderbook.New()
+				for i, id := range []string{"r1", "r2", "r3", "r4", "r5"} {
+					b.Add(order(id, "u", sd.resting, 10, sd.price(i), i))
+				}
+				for _, id := range tt.cancel {
+					if !b.Cancel(id) {
+						t.Fatalf("cancel %s: not found", id)
+					}
+				}
+				var got []string
+				for _, f := range b.Add(order("big", "x", sd.incoming, 1000, sd.incomingPx, 10)) {
+					got = append(got, sd.restingID(f))
+				}
+				if !slices.Equal(got, tt.wantFill) {
+					t.Errorf("fill order = %v, want %v", got, tt.wantFill)
+				}
+			})
+		}
 	}
 }
